@@ -14,7 +14,7 @@ import (
 func main() {
 	log.Println("Pulsar容灾容错测试项目")
 	log.Println("运行测试请使用: go test -v ./...")
-	
+
 	// 示例：创建客户端（需要Pulsar服务器运行）
 	if len(os.Args) > 1 && os.Args[1] == "example" {
 		runExample()
@@ -23,9 +23,10 @@ func main() {
 
 func runExample() {
 	config := DefaultConfig()
-	config.ServiceURL = "pulsar://localhost:6650"
-	config.Topic = "example-topic"
-	config.SubscriptionName = "example-subscription"
+	config.ServiceURL = "http://pulsar-rkrz2zpdnpv9.eap-jov4d79q.tdmq.ap-nj.internal.tencenttdmq.com:8080"
+	// topic完整路径，格式为persistent://集群（租户）ID/命名空间/Topic名称
+	config.Topic = "persistent://pulsar-rkrz2zpdnpv9/user00_9_134_133_147/example-topic"
+	config.SubscriptionName = "test-subscription"
 	config.MaxRetries = 3
 	config.EnableAutoReconnect = true
 
@@ -48,7 +49,7 @@ func runExample() {
 
 	// 发送消息示例
 	go func() {
-		for i := 0; i < 5; i++ {
+		for {
 			select {
 			case <-ctx.Done():
 				return
@@ -57,7 +58,7 @@ func runExample() {
 				if err := client.SendMessage(ctx, payload); err != nil {
 					log.Printf("发送消息失败: %v", err)
 				} else {
-					log.Printf("消息发送成功: %d", i+1)
+					log.Printf("消息发送成功")
 				}
 				time.Sleep(time.Second * 2)
 			}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
@@ -42,8 +44,9 @@ type ClientConfig struct {
 // DefaultConfig 返回默认配置
 func DefaultConfig() *ClientConfig {
 	return &ClientConfig{
-		ServiceURL:          "pulsar://localhost:6650",
-		Topic:               "test-topic",
+		ServiceURL: "http://pulsar-rkrz2zpdnpv9.eap-jov4d79q.tdmq.ap-nj.internal.tencenttdmq.com:8080",
+		// topic完整路径，格式为persistent://集群（租户）ID/命名空间/Topic名称
+		Topic:               "persistent://pulsar-rkrz2zpdnpv9/user00_9_134_133_147/example-topic",
 		SubscriptionName:    "test-subscription",
 		MaxRetries:          3,
 		RetryBackoff:        time.Second * 2,
@@ -67,6 +70,7 @@ func NewPulsarClient(config *ClientConfig) (*PulsarClient, error) {
 		URL:               config.ServiceURL,
 		ConnectionTimeout: config.ConnectionTimeout,
 		OperationTimeout:  config.OperationTimeout,
+		Authentication:    pulsar.NewAuthenticationToken("eyJrZXlJZCI6InB1bHNhci1ya3J6MnpwZG5wdjkiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJsZXRzZ28ifQ.Tr_GMjBqqaRJk5I_MvxejcvHCrgRCS2oLeu95Dn6eEI"),
 	}
 
 	client, err := pulsar.NewClient(clientOptions)
@@ -83,6 +87,7 @@ func NewPulsarClient(config *ClientConfig) (*PulsarClient, error) {
 		ctx:         ctx,
 		cancel:      cancel,
 	}
+	log.Printf("pulsar client created successfully for service: %s", config.ServiceURL)
 
 	// 创建生产者和消费者
 	if err := pc.initProducer(); err != nil {
@@ -121,16 +126,34 @@ func (pc *PulsarClient) initProducer() error {
 	pc.mu.Lock()
 	pc.producer = producer
 	pc.mu.Unlock()
+	log.Printf("producer created successfully for topic: %s", pc.config.Topic)
 
 	return nil
 }
 
+// GetProducer 获取生产者
+func (pc *PulsarClient) GetProducer() pulsar.Producer {
+	pc.mu.RLock()
+	producer := pc.producer
+	pc.mu.RUnlock()
+	return producer
+}
+
 // initConsumer 初始化消费者
 func (pc *PulsarClient) initConsumer() error {
+	dlqPolicy := &pulsar.DLQPolicy{
+		MaxDeliveries:    3,
+		DeadLetterTopic:  "persistent://pulsar-rkrz2zpdnpv9/user00_9_134_133_147/example-topic-test-subscription-DLQ",
+		RetryLetterTopic: "persistent://pulsar-rkrz2zpdnpv9/user00_9_134_133_147/example-topic-test-subscription-RETRY",
+	}
 	consumerOptions := pulsar.ConsumerOptions{
-		Topic:            pc.config.Topic,
-		SubscriptionName: pc.config.SubscriptionName,
-		Type:             pulsar.Shared,
+		Topic:               pc.config.Topic,
+		SubscriptionName:    pc.config.SubscriptionName,
+		Type:                pulsar.Shared,
+		RetryEnable:         true,
+		NackRedeliveryDelay: 1 * time.Second,
+		DLQ:                 dlqPolicy,
+		//Type: pulsar.KeyShared, // key共享模式
 	}
 
 	consumer, err := pc.client.Subscribe(consumerOptions)
@@ -141,8 +164,17 @@ func (pc *PulsarClient) initConsumer() error {
 	pc.mu.Lock()
 	pc.consumer = consumer
 	pc.mu.Unlock()
+	log.Printf("consumer created successfully for topic: %s", pc.config.Topic)
 
 	return nil
+}
+
+// GetConsumer 获取消费者
+func (pc *PulsarClient) GetConsumer() pulsar.Consumer {
+	pc.mu.RLock()
+	consumer := pc.consumer
+	pc.mu.RUnlock()
+	return consumer
 }
 
 // SendMessage 发送消息，带重试机制
@@ -162,6 +194,8 @@ func (pc *PulsarClient) SendMessage(ctx context.Context, payload []byte) error {
 		maxRetries = 0
 	}
 
+	seq := rand.Intn(101)
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			select {
@@ -172,6 +206,7 @@ func (pc *PulsarClient) SendMessage(ctx context.Context, payload []byte) error {
 		}
 
 		msg := &pulsar.ProducerMessage{
+			Key:     strconv.Itoa(int(seq)),
 			Payload: payload,
 		}
 
@@ -210,6 +245,7 @@ func (pc *PulsarClient) ReceiveMessage(ctx context.Context) (pulsar.Message, err
 		}
 		return nil, err
 	}
+	log.Printf("Received message: key:%s,content:%s", msg.Key(), string(msg.Payload()))
 
 	return msg, nil
 }
@@ -388,7 +424,7 @@ func (pc *PulsarClient) IsConnected() bool {
 
 // contains 检查字符串是否包含子串（忽略大小写）
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 || 
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
 		containsIgnoreCase(s, substr))
 }
 
