@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package resource.options;
+
+import "google/protobuf/descriptor.proto";
+
+// 字段是否为主键（一个 message 只能有一个）
+extend google.protobuf.FieldOptions {
+  bool primary_key = 50001;
+}
+
+// 索引定义（可多个索引；同一字段可加入多个索引名）
+message Index {
+  string name = 1; // 索引名（例如 "type", "level"）
+  bool unique = 2; // 是否唯一索引
+}
+
+// 字段上声明索引（可重复）
+extend google.protobuf.FieldOptions {
+  repeated Index index = 50002;
+}
+
+// 资源级配置（Excel sheet / 输出文件名等）
+extend google.protobuf.MessageOptions {
+  string sheet = 50011;     // Excel sheet 名（缺省用 message 名）
+  string out_file = 50012;  // 输出 pb 文件名（缺省用 message 名）
+}

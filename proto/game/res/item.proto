@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package game.res;
+
+import "resource/options.proto";
+
+message Item {
+  option (resource.options.sheet) = "Item";
+  option (resource.options.out_file) = "item.pb";
+
+  int32 id = 1 [(resource.options.primary_key) = true];
+  string name = 2;
+
+  int32 type = 3 [(resource.options.index) = { name: "type", unique: false }];
+  int32 quality = 4 [(resource.options.index) = { name: "quality", unique: false }];
+}
+
+message ItemTable {
+  repeated Item rows = 1;
+}
