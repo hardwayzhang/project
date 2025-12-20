@@ -1,0 +1,190 @@
+// item.proto - 物品配置表示例
+// 演示如何使用自定义选项定义主键和索引
+
+syntax = "proto3";
+
+package game;
+
+option go_package = "github.com/example/gores/example/generated;generated";
+
+import "proto/resoptions.proto";
+
+// 物品品质枚举
+enum ItemQuality {
+  QUALITY_UNKNOWN = 0;
+  QUALITY_COMMON = 1;   // 普通
+  QUALITY_UNCOMMON = 2; // 精良
+  QUALITY_RARE = 3;     // 稀有
+  QUALITY_EPIC = 4;     // 史诗
+  QUALITY_LEGENDARY = 5; // 传说
+}
+
+// 物品类型枚举
+enum ItemType {
+  TYPE_UNKNOWN = 0;
+  TYPE_WEAPON = 1;     // 武器
+  TYPE_ARMOR = 2;      // 护甲
+  TYPE_CONSUMABLE = 3; // 消耗品
+  TYPE_MATERIAL = 4;   // 材料
+  TYPE_QUEST = 5;      // 任务物品
+}
+
+// 物品属性(嵌套消息)
+message ItemAttribute {
+  string name = 1;   // 属性名
+  int32 value = 2;   // 属性值
+  float rate = 3;    // 属性系数
+}
+
+// 物品配置
+message ItemConfig {
+  option (gores.resource) = {
+    name: "item"
+    excel_file: "item_config"
+    sheet_name: "Sheet1"
+    description: "物品配置表"
+  };
+
+  // @primary_key
+  // 物品ID - 主键
+  int32 id = 1 [(gores.field) = {
+    primary_key: true
+    description: "物品唯一ID"
+  }];
+
+  // 物品名称
+  string name = 2 [(gores.field) = {
+    required: true
+    description: "物品名称"
+  }];
+
+  // 物品描述
+  string description = 3;
+
+  // @unique
+  // 物品代码 - 唯一索引
+  string code = 4 [(gores.field) = {
+    index: INDEX_UNIQUE
+    description: "物品代码,全局唯一"
+  }];
+
+  // @index
+  // 物品类型 - 普通索引
+  ItemType type = 5 [(gores.field) = {
+    index: INDEX_NORMAL
+    description: "物品类型"
+  }];
+
+  // @index
+  // 物品品质 - 普通索引
+  ItemQuality quality = 6 [(gores.field) = {
+    index: INDEX_NORMAL
+    description: "物品品质"
+  }];
+
+  // 等级要求
+  int32 level_required = 7;
+
+  // 价格
+  int64 price = 8;
+
+  // 堆叠上限
+  int32 stack_limit = 9 [(gores.field) = {
+    default_value: "99"
+  }];
+
+  // 物品属性列表(嵌套消息数组)
+  repeated ItemAttribute attributes = 10 [(gores.field) = {
+    array_separator: "|"
+    description: "物品属性列表"
+  }];
+
+  // 标签
+  repeated string tags = 11 [(gores.field) = {
+    array_separator: ","
+  }];
+
+  // 是否可交易
+  bool tradeable = 12;
+
+  // 图标路径
+  string icon = 13;
+}
+
+// 技能配置
+message SkillConfig {
+  option (gores.resource) = {
+    name: "skill"
+    excel_file: "skill_config"
+    description: "技能配置表"
+  };
+
+  // @primary_key
+  int32 id = 1 [(gores.field) = {
+    primary_key: true
+  }];
+
+  string name = 2;
+  string description = 3;
+
+  // @index
+  int32 skill_type = 4 [(gores.field) = {
+    index: INDEX_NORMAL
+  }];
+
+  int32 level = 5;
+  int32 mp_cost = 6;
+  float cooldown = 7;
+  float damage_rate = 8;
+
+  // 前置技能ID
+  int32 pre_skill_id = 9;
+}
+
+// 怪物配置(演示复合索引)
+message MonsterConfig {
+  option (gores.resource) = {
+    name: "monster"
+    excel_file: "monster_config"
+    description: "怪物配置表"
+  };
+
+  // @primary_key
+  int32 id = 1 [(gores.field) = {
+    primary_key: true
+  }];
+
+  string name = 2;
+
+  // 场景ID和怪物类型组成复合索引
+  // @composite_index(name="scene_type", order=1)
+  int32 scene_id = 3 [(gores.field) = {
+    index: INDEX_COMPOSITE
+    index_name: "scene_type"
+    index_order: 1
+  }];
+
+  // @composite_index(name="scene_type", order=2)
+  int32 monster_type = 4 [(gores.field) = {
+    index: INDEX_COMPOSITE
+    index_name: "scene_type"
+    index_order: 2
+  }];
+
+  int32 level = 5;
+  int64 hp = 6;
+  int32 attack = 7;
+  int32 defense = 8;
+  float attack_speed = 9;
+  float move_speed = 10;
+
+  // 掉落物品ID列表
+  repeated int32 drop_items = 11 [(gores.field) = {
+    array_separator: ","
+  }];
+
+  // 掉落概率(与drop_items对应)
+  repeated float drop_rates = 12 [(gores.field) = {
+    array_separator: ","
+  }];
+}
