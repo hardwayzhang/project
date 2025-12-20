@@ -5,6 +5,9 @@ package main
 
 import (
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/proto"
+
+	goresproto "github.com/example/gores/proto"
 )
 
 func main() {
@@ -51,45 +54,170 @@ func generateFile(gen *protogen.Plugin, file *protogen.File) {
 	}
 }
 
-func generateResourceManager(g *protogen.GeneratedFile, msg *protogen.Message) {
-	msgName := msg.GoIdent.GoName
+// getFieldOptions 从字段描述符中获取自定义选项
+func getFieldOptions(field *protogen.Field) *goresproto.FieldOptions {
+	opts := field.Desc.Options()
+	if opts == nil {
+		return nil
+	}
 
-	// 分析字段,找出主键和索引
-	var primaryKeyField *protogen.Field
-	var indexFields []*protogen.Field
-	var uniqueIndexFields []*protogen.Field
+	// 使用 proto.GetExtension 获取自定义字段选项
+	ext := proto.GetExtension(opts, goresproto.E_Field)
+	if ext == nil {
+		return nil
+	}
+
+	fieldOpts, ok := ext.(*goresproto.FieldOptions)
+	if !ok {
+		return nil
+	}
+
+	return fieldOpts
+}
+
+// getResourceOptions 从消息描述符中获取自定义选项
+func getResourceOptions(msg *protogen.Message) *goresproto.ResourceOptions {
+	opts := msg.Desc.Options()
+	if opts == nil {
+		return nil
+	}
+
+	// 使用 proto.GetExtension 获取自定义资源选项
+	ext := proto.GetExtension(opts, goresproto.E_Resource)
+	if ext == nil {
+		return nil
+	}
+
+	resOpts, ok := ext.(*goresproto.ResourceOptions)
+	if !ok {
+		return nil
+	}
+
+	return resOpts
+}
+
+// FieldMeta 字段元信息
+type FieldMeta struct {
+	Field        *protogen.Field
+	IsPrimaryKey bool
+	IndexType    goresproto.IndexType
+	IndexName    string
+	IndexOrder   int32
+}
+
+// analyzeFields 分析消息的所有字段,提取主键和索引信息
+func analyzeFields(msg *protogen.Message) (primaryKey *FieldMeta, uniqueIndexes, normalIndexes []*FieldMeta, compositeIndexes map[string][]*FieldMeta) {
+	compositeIndexes = make(map[string][]*FieldMeta)
 
 	for _, field := range msg.Fields {
 		opts := getFieldOptions(field)
-		if opts.IsPrimaryKey {
-			primaryKeyField = field
+		if opts == nil {
+			continue
 		}
-		if opts.IndexType == IndexTypeUnique {
-			uniqueIndexFields = append(uniqueIndexFields, field)
-		} else if opts.IndexType == IndexTypeNormal {
-			indexFields = append(indexFields, field)
+
+		meta := &FieldMeta{
+			Field:        field,
+			IsPrimaryKey: opts.GetPrimaryKey(),
+			IndexType:    opts.GetIndex(),
+			IndexName:    opts.GetIndexName(),
+			IndexOrder:   opts.GetIndexOrder(),
+		}
+
+		// 处理主键
+		if meta.IsPrimaryKey {
+			primaryKey = meta
+		}
+
+		// 处理索引
+		switch meta.IndexType {
+		case goresproto.IndexType_INDEX_UNIQUE:
+			uniqueIndexes = append(uniqueIndexes, meta)
+		case goresproto.IndexType_INDEX_NORMAL:
+			normalIndexes = append(normalIndexes, meta)
+		case goresproto.IndexType_INDEX_COMPOSITE:
+			if meta.IndexName != "" {
+				compositeIndexes[meta.IndexName] = append(compositeIndexes[meta.IndexName], meta)
+			}
 		}
 	}
+
+	// 对复合索引按顺序排序
+	for name := range compositeIndexes {
+		fields := compositeIndexes[name]
+		// 简单冒泡排序
+		for i := 0; i < len(fields)-1; i++ {
+			for j := i + 1; j < len(fields); j++ {
+				if fields[i].IndexOrder > fields[j].IndexOrder {
+					fields[i], fields[j] = fields[j], fields[i]
+				}
+			}
+		}
+	}
+
+	return
+}
+
+func generateResourceManager(g *protogen.GeneratedFile, msg *protogen.Message) {
+	msgName := msg.GoIdent.GoName
+
+	// 获取资源选项
+	resOpts := getResourceOptions(msg)
+	if resOpts != nil {
+		g.P("// Resource: ", resOpts.GetName())
+		if resOpts.GetDescription() != "" {
+			g.P("// Description: ", resOpts.GetDescription())
+		}
+	}
+
+	// 分析字段
+	primaryKey, uniqueIndexes, normalIndexes, compositeIndexes := analyzeFields(msg)
 
 	// 生成资源管理器结构体
 	g.P("// ", msgName, "Manager 管理", msgName, "资源的加载和访问")
 	g.P("type ", msgName, "Manager struct {")
 	g.P("	mu sync.RWMutex")
 	g.P("	items []*", msgName)
-	if primaryKeyField != nil {
-		keyType := getGoTypeName(primaryKeyField)
+
+	// 主键索引
+	if primaryKey != nil {
+		keyType := getGoTypeName(primaryKey.Field)
 		g.P("	byPrimaryKey map[", keyType, "]*", msgName)
 	}
-	for _, field := range uniqueIndexFields {
-		keyType := getGoTypeName(field)
-		g.P("	by", field.GoName, " map[", keyType, "]*", msgName)
+
+	// 唯一索引
+	for _, idx := range uniqueIndexes {
+		keyType := getGoTypeName(idx.Field)
+		g.P("	by", idx.Field.GoName, " map[", keyType, "]*", msgName)
 	}
-	for _, field := range indexFields {
-		keyType := getGoTypeName(field)
-		g.P("	by", field.GoName, " map[", keyType, "][]*", msgName)
+
+	// 普通索引
+	for _, idx := range normalIndexes {
+		keyType := getGoTypeName(idx.Field)
+		g.P("	by", idx.Field.GoName, " map[", keyType, "][]*", msgName)
 	}
+
+	// 复合索引
+	for name, fields := range compositeIndexes {
+		keyTypeName := toCamelCase(name) + "Key"
+		g.P("	by", toCamelCase(name), " map[", keyTypeName, "][]*", msgName)
+		_ = fields // 后面会用到
+	}
+
 	g.P("}")
 	g.P()
+
+	// 生成复合索引的键类型
+	for name, fields := range compositeIndexes {
+		keyTypeName := toCamelCase(name) + "Key"
+		g.P("// ", keyTypeName, " ", name, "复合索引键")
+		g.P("type ", keyTypeName, " struct {")
+		for _, f := range fields {
+			keyType := getGoTypeName(f.Field)
+			g.P("	", f.Field.GoName, " ", keyType)
+		}
+		g.P("}")
+		g.P()
+	}
 
 	// 生成全局实例
 	g.P("var (")
@@ -130,18 +258,31 @@ func generateResourceManager(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("	offset := 4")
 	g.P()
 	g.P("	items := make([]*", msgName, ", 0, count)")
-	if primaryKeyField != nil {
-		keyType := getGoTypeName(primaryKeyField)
+
+	// 初始化主键索引
+	if primaryKey != nil {
+		keyType := getGoTypeName(primaryKey.Field)
 		g.P("	byPrimaryKey := make(map[", keyType, "]*", msgName, ", count)")
 	}
-	for _, field := range uniqueIndexFields {
-		keyType := getGoTypeName(field)
-		g.P("	by", field.GoName, " := make(map[", keyType, "]*", msgName, ", count)")
+
+	// 初始化唯一索引
+	for _, idx := range uniqueIndexes {
+		keyType := getGoTypeName(idx.Field)
+		g.P("	by", idx.Field.GoName, " := make(map[", keyType, "]*", msgName, ", count)")
 	}
-	for _, field := range indexFields {
-		keyType := getGoTypeName(field)
-		g.P("	by", field.GoName, " := make(map[", keyType, "][]*", msgName, ")")
+
+	// 初始化普通索引
+	for _, idx := range normalIndexes {
+		keyType := getGoTypeName(idx.Field)
+		g.P("	by", idx.Field.GoName, " := make(map[", keyType, "][]*", msgName, ")")
 	}
+
+	// 初始化复合索引
+	for name := range compositeIndexes {
+		keyTypeName := toCamelCase(name) + "Key"
+		g.P("	by", toCamelCase(name), " := make(map[", keyTypeName, "][]*", msgName, ")")
+	}
+
 	g.P()
 	g.P("	for i := uint32(0); i < count; i++ {")
 	g.P("		if offset+4 > len(data) {")
@@ -161,28 +302,51 @@ func generateResourceManager(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("		offset += int(length)")
 	g.P()
 	g.P("		items = append(items, item)")
-	if primaryKeyField != nil {
-		g.P("		byPrimaryKey[item.", primaryKeyField.GoName, "] = item")
+
+	// 填充主键索引
+	if primaryKey != nil {
+		g.P("		byPrimaryKey[item.", primaryKey.Field.GoName, "] = item")
 	}
-	for _, field := range uniqueIndexFields {
-		g.P("		by", field.GoName, "[item.", field.GoName, "] = item")
+
+	// 填充唯一索引
+	for _, idx := range uniqueIndexes {
+		g.P("		by", idx.Field.GoName, "[item.", idx.Field.GoName, "] = item")
 	}
-	for _, field := range indexFields {
-		g.P("		by", field.GoName, "[item.", field.GoName, "] = append(by", field.GoName, "[item.", field.GoName, "], item)")
+
+	// 填充普通索引
+	for _, idx := range normalIndexes {
+		g.P("		by", idx.Field.GoName, "[item.", idx.Field.GoName, "] = append(by", idx.Field.GoName, "[item.", idx.Field.GoName, "], item)")
 	}
+
+	// 填充复合索引
+	for name, fields := range compositeIndexes {
+		keyTypeName := toCamelCase(name) + "Key"
+		g.P("		", name, "Key := ", keyTypeName, "{")
+		for _, f := range fields {
+			g.P("			", f.Field.GoName, ": item.", f.Field.GoName, ",")
+		}
+		g.P("		}")
+		g.P("		by", toCamelCase(name), "[", name, "Key] = append(by", toCamelCase(name), "[", name, "Key], item)")
+	}
+
 	g.P("	}")
 	g.P()
 	g.P("	m.mu.Lock()")
 	g.P("	m.items = items")
-	if primaryKeyField != nil {
+
+	if primaryKey != nil {
 		g.P("	m.byPrimaryKey = byPrimaryKey")
 	}
-	for _, field := range uniqueIndexFields {
-		g.P("	m.by", field.GoName, " = by", field.GoName)
+	for _, idx := range uniqueIndexes {
+		g.P("	m.by", idx.Field.GoName, " = by", idx.Field.GoName)
 	}
-	for _, field := range indexFields {
-		g.P("	m.by", field.GoName, " = by", field.GoName)
+	for _, idx := range normalIndexes {
+		g.P("	m.by", idx.Field.GoName, " = by", idx.Field.GoName)
 	}
+	for name := range compositeIndexes {
+		g.P("	m.by", toCamelCase(name), " = by", toCamelCase(name))
+	}
+
 	g.P("	m.mu.Unlock()")
 	g.P()
 	g.P("	return nil")
@@ -210,8 +374,8 @@ func generateResourceManager(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P()
 
 	// 生成主键访问函数
-	if primaryKeyField != nil {
-		keyType := getGoTypeName(primaryKeyField)
+	if primaryKey != nil {
+		keyType := getGoTypeName(primaryKey.Field)
 		g.P("// Get 根据主键获取", msgName)
 		g.P("func (m *", msgName, "Manager) Get(key ", keyType, ") (*", msgName, ", bool) {")
 		g.P("	m.mu.RLock()")
@@ -242,26 +406,60 @@ func generateResourceManager(g *protogen.GeneratedFile, msg *protogen.Message) {
 	}
 
 	// 生成唯一索引访问函数
-	for _, field := range uniqueIndexFields {
-		keyType := getGoTypeName(field)
-		g.P("// GetBy", field.GoName, " 根据", field.GoName, "获取", msgName)
-		g.P("func (m *", msgName, "Manager) GetBy", field.GoName, "(key ", keyType, ") (*", msgName, ", bool) {")
+	for _, idx := range uniqueIndexes {
+		keyType := getGoTypeName(idx.Field)
+		g.P("// GetBy", idx.Field.GoName, " 根据", idx.Field.GoName, "获取", msgName)
+		g.P("func (m *", msgName, "Manager) GetBy", idx.Field.GoName, "(key ", keyType, ") (*", msgName, ", bool) {")
 		g.P("	m.mu.RLock()")
 		g.P("	defer m.mu.RUnlock()")
-		g.P("	item, ok := m.by", field.GoName, "[key]")
+		g.P("	item, ok := m.by", idx.Field.GoName, "[key]")
 		g.P("	return item, ok")
 		g.P("}")
 		g.P()
 	}
 
 	// 生成普通索引访问函数
-	for _, field := range indexFields {
-		keyType := getGoTypeName(field)
-		g.P("// GetBy", field.GoName, " 根据", field.GoName, "获取", msgName, "列表")
-		g.P("func (m *", msgName, "Manager) GetBy", field.GoName, "(key ", keyType, ") []*", msgName, " {")
+	for _, idx := range normalIndexes {
+		keyType := getGoTypeName(idx.Field)
+		g.P("// GetBy", idx.Field.GoName, " 根据", idx.Field.GoName, "获取", msgName, "列表")
+		g.P("func (m *", msgName, "Manager) GetBy", idx.Field.GoName, "(key ", keyType, ") []*", msgName, " {")
 		g.P("	m.mu.RLock()")
 		g.P("	defer m.mu.RUnlock()")
-		g.P("	items := m.by", field.GoName, "[key]")
+		g.P("	items := m.by", idx.Field.GoName, "[key]")
+		g.P("	if items == nil {")
+		g.P("		return nil")
+		g.P("	}")
+		g.P("	result := make([]*", msgName, ", len(items))")
+		g.P("	copy(result, items)")
+		g.P("	return result")
+		g.P("}")
+		g.P()
+	}
+
+	// 生成复合索引访问函数
+	for name, fields := range compositeIndexes {
+		keyTypeName := toCamelCase(name) + "Key"
+		funcName := "GetBy" + toCamelCase(name)
+
+		// 生成参数列表
+		params := ""
+		for i, f := range fields {
+			if i > 0 {
+				params += ", "
+			}
+			params += toParamName(f.Field.GoName) + " " + getGoTypeName(f.Field)
+		}
+
+		g.P("// ", funcName, " 根据复合索引", name, "获取", msgName, "列表")
+		g.P("func (m *", msgName, "Manager) ", funcName, "(", params, ") []*", msgName, " {")
+		g.P("	m.mu.RLock()")
+		g.P("	defer m.mu.RUnlock()")
+		g.P("	key := ", keyTypeName, "{")
+		for _, f := range fields {
+			g.P("		", f.Field.GoName, ": ", toParamName(f.Field.GoName), ",")
+		}
+		g.P("	}")
+		g.P("	items := m.by", toCamelCase(name), "[key]")
 		g.P("	if items == nil {")
 		g.P("		return nil")
 		g.P("	}")
@@ -299,72 +497,20 @@ func generateResourceManager(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("	return result")
 	g.P("}")
 	g.P()
-}
 
-// IndexType 索引类型
-type IndexType int
-
-const (
-	IndexTypeNone   IndexType = 0
-	IndexTypeUnique IndexType = 1
-	IndexTypeNormal IndexType = 2
-)
-
-// FieldOptions 字段选项
-type FieldOptions struct {
-	IsPrimaryKey bool
-	IndexType    IndexType
-	IndexName    string
-}
-
-// getFieldOptions 获取字段选项
-func getFieldOptions(field *protogen.Field) FieldOptions {
-	opts := FieldOptions{}
-
-	// 从proto选项中获取自定义属性
-	// 这里通过解析描述符选项来获取
-	if field.Desc.Options() != nil {
-		// 检查是否有自定义选项
-		// 在实际使用中,需要注册并解析自定义选项
-		// 这里使用字段注释作为替代方案
-		comments := string(field.Comments.Leading)
-		if containsTag(comments, "@primary_key") {
-			opts.IsPrimaryKey = true
-		}
-		if containsTag(comments, "@unique") {
-			opts.IndexType = IndexTypeUnique
-		}
-		if containsTag(comments, "@index") {
-			opts.IndexType = IndexTypeNormal
-		}
-	}
-
-	return opts
-}
-
-// containsTag 检查注释中是否包含指定标签
-func containsTag(comments, tag string) bool {
-	return len(comments) > 0 && (comments == tag || 
-		len(comments) > len(tag) && 
-		(comments[:len(tag)] == tag || 
-		 comments[len(comments)-len(tag):] == tag ||
-		 containsSubstring(comments, " "+tag+" ") ||
-		 containsSubstring(comments, " "+tag+"\n") ||
-		 containsSubstring(comments, "\n"+tag+" ") ||
-		 containsSubstring(comments, "\n"+tag+"\n")))
-}
-
-func containsSubstring(s, substr string) bool {
-	return len(s) >= len(substr) && findSubstring(s, substr) >= 0
-}
-
-func findSubstring(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
+	// 生成查找函数
+	g.P("// Find 查找第一个匹配的", msgName)
+	g.P("func (m *", msgName, "Manager) Find(fn func(item *", msgName, ") bool) (*", msgName, ", bool) {")
+	g.P("	m.mu.RLock()")
+	g.P("	defer m.mu.RUnlock()")
+	g.P("	for _, item := range m.items {")
+	g.P("		if fn(item) {")
+	g.P("			return item, true")
+	g.P("		}")
+	g.P("	}")
+	g.P("	return nil, false")
+	g.P("}")
+	g.P()
 }
 
 // getGoTypeName 获取Go类型名
@@ -374,12 +520,16 @@ func getGoTypeName(field *protogen.Field) string {
 		return "float64"
 	case 2: // float
 		return "float32"
-	case 3, 4, 18: // int64, uint64, sint64
+	case 3: // int64
 		return "int64"
-	case 5, 17: // int32, sint32
-		return "int32"
-	case 6, 7: // fixed64, fixed32
+	case 4: // uint64
 		return "uint64"
+	case 5: // int32
+		return "int32"
+	case 6: // fixed64
+		return "uint64"
+	case 7: // fixed32
+		return "uint32"
 	case 8: // bool
 		return "bool"
 	case 9: // string
@@ -390,9 +540,47 @@ func getGoTypeName(field *protogen.Field) string {
 		return "uint32"
 	case 14: // enum
 		return field.Enum.GoIdent.GoName
-	case 15, 16: // sfixed32, sfixed64
+	case 15: // sfixed32
 		return "int32"
+	case 16: // sfixed64
+		return "int64"
+	case 17: // sint32
+		return "int32"
+	case 18: // sint64
+		return "int64"
 	default:
 		return "interface{}"
 	}
+}
+
+// toCamelCase 将下划线命名转换为驼峰命名
+func toCamelCase(s string) string {
+	result := ""
+	upper := true
+	for _, c := range s {
+		if c == '_' {
+			upper = true
+			continue
+		}
+		if upper {
+			if c >= 'a' && c <= 'z' {
+				c = c - 'a' + 'A'
+			}
+			upper = false
+		}
+		result += string(c)
+	}
+	return result
+}
+
+// toParamName 将字段名转换为参数名(首字母小写)
+func toParamName(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	first := s[0]
+	if first >= 'A' && first <= 'Z' {
+		first = first - 'A' + 'a'
+	}
+	return string(first) + s[1:]
 }

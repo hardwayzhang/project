@@ -45,7 +45,6 @@ message ItemConfig {
     description: "物品配置表"
   };
 
-  // @primary_key
   // 物品ID - 主键
   int32 id = 1 [(gores.field) = {
     primary_key: true
@@ -61,21 +60,18 @@ message ItemConfig {
   // 物品描述
   string description = 3;
 
-  // @unique
   // 物品代码 - 唯一索引
   string code = 4 [(gores.field) = {
     index: INDEX_UNIQUE
     description: "物品代码,全局唯一"
   }];
 
-  // @index
   // 物品类型 - 普通索引
   ItemType type = 5 [(gores.field) = {
     index: INDEX_NORMAL
     description: "物品类型"
   }];
 
-  // @index
   // 物品品质 - 普通索引
   ItemQuality quality = 6 [(gores.field) = {
     index: INDEX_NORMAL
@@ -119,7 +115,7 @@ message SkillConfig {
     description: "技能配置表"
   };
 
-  // @primary_key
+  // 主键
   int32 id = 1 [(gores.field) = {
     primary_key: true
   }];
@@ -127,7 +123,7 @@ message SkillConfig {
   string name = 2;
   string description = 3;
 
-  // @index
+  // 技能类型索引
   int32 skill_type = 4 [(gores.field) = {
     index: INDEX_NORMAL
   }];
@@ -149,22 +145,21 @@ message MonsterConfig {
     description: "怪物配置表"
   };
 
-  // @primary_key
+  // 主键
   int32 id = 1 [(gores.field) = {
     primary_key: true
   }];
 
   string name = 2;
 
-  // 场景ID和怪物类型组成复合索引
-  // @composite_index(name="scene_type", order=1)
+  // 场景ID - 复合索引第一部分
   int32 scene_id = 3 [(gores.field) = {
     index: INDEX_COMPOSITE
     index_name: "scene_type"
     index_order: 1
   }];
 
-  // @composite_index(name="scene_type", order=2)
+  // 怪物类型 - 复合索引第二部分
   int32 monster_type = 4 [(gores.field) = {
     index: INDEX_COMPOSITE
     index_name: "scene_type"

@@ -5,7 +5,7 @@ syntax = "proto3";
 
 package gores;
 
-option go_package = "github.com/example/gores/proto;goresproto";
+option go_package = "github.com/example/gores/proto";
 
 import "google/protobuf/descriptor.proto";
 
