@@ -1,0 +1,101 @@
+// resoptions.proto - 资源管理自定义选项定义
+// 用于描述Excel数据的主键和索引属性
+
+syntax = "proto3";
+
+package gores;
+
+option go_package = "github.com/example/gores/proto";
+
+import "google/protobuf/descriptor.proto";
+
+// ===============================
+// 消息级别选项 - 用于描述整个资源表的属性
+// ===============================
+
+message ResourceOptions {
+  // 资源名称,用于生成文件名和访问接口
+  string name = 1;
+  
+  // Excel文件名(不含扩展名)
+  string excel_file = 2;
+  
+  // Excel工作表名称,默认为Sheet1
+  string sheet_name = 3;
+  
+  // 是否启用热更新
+  bool hot_reload = 4;
+  
+  // 资源描述
+  string description = 5;
+}
+
+extend google.protobuf.MessageOptions {
+  // 资源选项扩展
+  ResourceOptions resource = 50001;
+}
+
+// ===============================
+// 字段级别选项 - 用于描述字段的主键和索引属性
+// ===============================
+
+// 索引类型
+enum IndexType {
+  INDEX_NONE = 0;      // 无索引
+  INDEX_UNIQUE = 1;    // 唯一索引
+  INDEX_NORMAL = 2;    // 普通索引(可重复)
+  INDEX_COMPOSITE = 3; // 复合索引成员
+}
+
+message FieldOptions {
+  // 是否为主键
+  bool primary_key = 1;
+  
+  // 索引类型
+  IndexType index = 2;
+  
+  // 索引名称(用于复合索引分组)
+  string index_name = 3;
+  
+  // 复合索引中的顺序
+  int32 index_order = 4;
+  
+  // Excel列名映射(如果与字段名不同)
+  string column_name = 5;
+  
+  // 是否必填
+  bool required = 6;
+  
+  // 默认值(字符串形式)
+  string default_value = 7;
+  
+  // 字段描述
+  string description = 8;
+  
+  // 嵌套消息的分隔符(用于Excel中表示嵌套结构)
+  string nested_separator = 9;
+  
+  // 数组分隔符(用于Excel中表示数组)
+  string array_separator = 10;
+}
+
+extend google.protobuf.FieldOptions {
+  // 字段选项扩展
+  FieldOptions field = 50002;
+}
+
+// ===============================
+// 枚举级别选项
+// ===============================
+
+message EnumValueOptions {
+  // 枚举值在Excel中的别名
+  string alias = 1;
+  
+  // 枚举值描述
+  string description = 2;
+}
+
+extend google.protobuf.EnumValueOptions {
+  EnumValueOptions enum_value = 50003;
+}

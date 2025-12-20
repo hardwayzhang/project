@@ -1,0 +1,6 @@
+id,name,description,code,type,quality,level_required,price,stack_limit,attributes,tags,tradeable,icon
+1001,铁剑,一把普通的铁剑,iron_sword,1,1,1,100,1,,weapon|sword|iron,true,icons/weapons/iron_sword.png
+1002,钢剑,一把锋利的钢剑,steel_sword,1,2,10,500,1,,weapon|sword|steel,true,icons/weapons/steel_sword.png
+1003,生命药水,恢复100点生命值,hp_potion,3,1,1,50,99,,consumable|potion|healing,true,icons/consumables/hp_potion.png
+1004,铁矿石,用于锻造的铁矿石,iron_ore,4,1,1,10,999,,material|ore|iron,true,icons/materials/iron_ore.png
+1005,传说之剑,蕴含神秘力量的传说武器,legendary_sword,1,5,50,100000,1,"{""name"":""attack"",""value"":500,""rate"":1.5}|{""name"":""critical"",""value"":20,""rate"":1.0}",weapon|sword|legendary,false,icons/weapons/legendary_sword.png
