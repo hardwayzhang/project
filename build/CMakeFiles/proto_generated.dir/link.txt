@@ -1,0 +1,2 @@
+/usr/bin/ar qc libproto_generated.a CMakeFiles/proto_generated.dir/generated/options.pb.cc.o CMakeFiles/proto_generated.dir/generated/messages.pb.cc.o
+/usr/bin/ranlib libproto_generated.a

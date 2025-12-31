@@ -1,0 +1,2 @@
+/usr/bin/ar qc libproto_converter.a CMakeFiles/proto_converter.dir/src/proto_converter.cpp.o CMakeFiles/proto_converter.dir/src/reverse_converter.cpp.o
+/usr/bin/ranlib libproto_converter.a

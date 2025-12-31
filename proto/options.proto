@@ -1,0 +1,20 @@
+// options.proto
+// 定义protobuf消息转换所需的扩展选项
+
+syntax = "proto3";
+
+package tcaplus;
+
+import "google/protobuf/descriptor.proto";
+
+// 扩展 MessageOptions，添加自定义选项
+extend google.protobuf.MessageOptions {
+    // 主键字段列表，逗号分隔的字段名
+    // 例如: "ruid,type"
+    optional string tcaplus_primary_key = 60000;
+    
+    // 是否转换普通字段
+    // 当为true时，非主键字段且不是Metadata类型的字段会被转换为bytes类型
+    // 字段名变为 data_X，其中X为原字段的tag值
+    optional bool convert_normal_field = 60001;
+}

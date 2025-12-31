@@ -1,0 +1,41 @@
+// messages.proto
+// 定义消息结构
+
+syntax = "proto3";
+
+package tcaplus;
+
+import "options.proto";
+
+// Metadata 是一个特殊类型，在转换时会被保留
+message Metadata {
+    int32 version = 1;      // 版本号: 非零同时用于版本号校验
+    int32 lock_time = 3;    // 数据锁过期时间
+    uint64 lock_id = 4;     // 数据锁unique id
+}
+
+// 测试值类型
+message TestValue {
+    int32 value = 1;
+}
+
+// 输入消息类型 - 带有转换选项
+message GenericTest {
+    option (tcaplus_primary_key) = "ruid,type";
+    option (convert_normal_field) = true;
+
+    uint64 ruid = 1;        // 主键字段
+    uint64 type = 2;        // 主键字段
+    Metadata meta = 3;      // Metadata类型，保留
+    TestValue value1 = 4;   // 将转换为 bytes data_4
+    string value2 = 5;      // 将转换为 bytes data_5
+}
+
+// 输出消息类型 - 转换后的结构
+message GenericTestOutput {
+    uint64 ruid = 1;        // 主键字段，保留
+    uint64 type = 2;        // 主键字段，保留
+    Metadata meta = 3;      // Metadata类型，保留
+    bytes data_4 = 4;       // 从 TestValue value1 转换而来
+    bytes data_5 = 5;       // 从 string value2 转换而来
+}

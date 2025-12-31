@@ -1,0 +1,1 @@
+/usr/bin/g++ CMakeFiles/converter_test.dir/src/main.cpp.o -o converter_test  libproto_converter.a libproto_generated.a /usr/lib/x86_64-linux-gnu/libprotobuf.so 
