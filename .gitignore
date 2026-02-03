@@ -1,0 +1,33 @@
+# Output files
+steam_reviews.csv
+*.csv
+
+# Checkpoint files
+checkpoint.json
+
+# Log files
+*.log
+scraper.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
