@@ -1,0 +1,7 @@
+# Steam Review Scraper Dependencies
+# Python 3.11+ recommended
+
+aiohttp>=3.9.0
+aiofiles>=23.2.1
+pandas>=2.1.0
+tqdm>=4.66.0

@@ -1,0 +1,12 @@
+name: steam_scraper
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - aiohttp>=3.9.0
+    - aiofiles>=23.2.1
+    - pandas>=2.1.0
+    - tqdm>=4.66.0
