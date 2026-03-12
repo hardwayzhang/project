@@ -1,0 +1,26 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "DS Memory Profiler",
+	"Description": "Linux Dedicated Server memory profiling, allocation tracking, per-module stats and leak detection. Only active on Linux DS builds.",
+	"Category": "Profiling",
+	"CreatedBy": "Project Team",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "DSMemProfiler",
+			"Type": "Runtime",
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": ["Linux"],
+			"TargetAllowList": ["Server", "Editor"]
+		}
+	]
+}
