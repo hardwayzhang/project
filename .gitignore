@@ -1,0 +1,4 @@
+*.o
+*.nofp.o
+bench_backtrace
+bench_backtrace_nofp
