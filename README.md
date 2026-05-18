@@ -117,25 +117,44 @@ LDFLAGS = -rdynamic -pthread                # 让 backtrace_symbols() 能解析�
   #5 ./bench_backtrace(_start+0x25)
 ```
 
-性能(每项 200000 次调用,栈深度通过递归构造):
+性能(每项 50000 次调用,栈深度通过递归构造):
 
-| stack depth | glibc `backtrace()` | `fast_backtrace()` | speedup |
-|------------:|--------------------:|-------------------:|--------:|
-|   ~4 (10 帧) |          648.4 ns/call |           7.0 ns/call |  92.3× |
-|  ~16 (22 帧) |          643.6 ns/call |           7.1 ns/call |  91.1× |
-|  ~64 (70 帧) |          650.1 ns/call |           7.1 ns/call |  91.9× |
-| ~128 (134 帧) |         642.0 ns/call |           7.1 ns/call |  90.7× |
+| recurse depth | unwind 帧数 | glibc `backtrace()` | `fast_backtrace()` | speedup |
+|--------------:|-----------:|--------------------:|-------------------:|--------:|
+|             4 |          9 |              852 ns |             9.6 ns |  88.9× |
+|            16 |         21 |             1634 ns |            20.2 ns |  81.0× |
+|            64 |         69 |             4790 ns |              72 ns |  66.5× |
+|           128 |        133 |             9024 ns |             152 ns |  59.3× |
+
+线性回归一下两个 unwinder 的"固定开销 + 每帧开销":
+
+| | 固定开销(per call)| 每帧开销 |
+|---|---|---|
+| glibc `backtrace()` | ~250 ns | ~66 ns/frame |
+| `fast_backtrace()` (FP) | ~0 ns | ~1.1 ns/frame |
 
 可以看到:
 
-* `fast_backtrace` 在 64 位机器上**每帧大约 50 ps 量级**,因为只是
-  两次内存 load + 三个分支,完全在 L1 命中。
-* glibc `backtrace()` 即使在缓存温热的紧密循环里,也有**约 640 ns
-  的固定开销**(libgcc 锁、`_Unwind_Backtrace` 状态机的初始化),
-  与栈深度几乎无关——这也解释了为什么很多 trace/sampling 框架
-  (folly `symbolizer`、tcmalloc、Google `absl`)都自己实现了
-  frame-pointer unwinder。
-* 总体加速比约 **90–95×**。
+* `fast_backtrace()` 每帧只要约 **1 ns**,基本就是两条 mov + 一次比较,
+  L1 命中下纯指针追逐;固定开销小到接近测不出来。
+* glibc `backtrace()` 即使在缓存温热的紧密循环里也有**~250 ns 固定
+  开销**(libgcc 锁、`_Unwind_Backtrace` 状态机初始化、第一次调用的
+  `dlopen`)外加**每帧 ~66 ns** 的 DWARF CFI 解释执行成本。
+* 因此栈越浅加速比越大(固定开销主导,~90×),栈越深加速比稍降但
+  仍有 **60× 量级**。这也是 folly、tcmalloc、absl、perf、bcc/eBPF 都
+  自己实现 frame-pointer unwinder 的根本原因。
+
+> ### 关于这个 benchmark 的一个坑
+>
+> 如果用最朴素的写法 `return recurse(depth - 1) + 1;` 来构造深栈,
+> gcc -O2 会启用 **tail-recursion modulo addition** 优化,把 N 层
+> 递归整体改写成一个累加循环,运行时只剩一个 `recurse` 栈帧——
+> 此时 unwinder 看到的"depth=128"其实是浅栈。`__attribute__((noinline))`
+> 只能阻止内联,阻止不了这种**函数体内部的结构改写**。
+> 本基准里在递归调用之后插了一条 `__asm__ __volatile__("" : "+r"(r) :: "memory")`
+> 屏障,显式地告诉编译器"返回值之后还会发生不可见的副作用",
+> 才把这次优化压住。可以用 `objdump -d bench_backtrace` 查 `<recurse>`
+> 看到真实的 `call recurse` 指令。
 
 ## 5. 反例:去掉 `-fno-omit-frame-pointer` 会怎样
 

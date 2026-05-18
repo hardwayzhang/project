@@ -21,11 +21,16 @@
 #include <time.h>
 #include <stdint.h>
 
-#define MAX_FRAMES 64
+#define MAX_FRAMES 256
 
 /* Use volatile sinks so the optimiser does not delete the calls. */
 static volatile int    g_sink_n;
 static void * volatile g_sink_buf[MAX_FRAMES];
+/* Reported separately from recurse()'s return value, because gcc's
+ * tail-recursion-modulo-addition optimisation (see recurse() below)
+ * makes the return value an unreliable proxy for the actual unwind
+ * depth. The bench function writes here on every iteration. */
+static volatile int    g_actual_frames;
 
 static inline uint64_t now_ns(void)
 {
@@ -38,16 +43,31 @@ static inline uint64_t now_ns(void)
 
 typedef int (*bench_fn_t)(int iters);
 
-/* __attribute__((noinline)) to keep the frames distinct even at -O2. */
+/*
+ * __attribute__((noinline)) keeps the function out-of-line, but it does
+ * NOT prevent gcc from rewriting the body. With -O2, gcc applies
+ * "tail-recursion modulo addition" and turns
+ *
+ *     return recurse(depth - 1, ...) + 1;
+ *
+ * into an iterative loop with an accumulator -- collapsing all N levels
+ * into a single stack frame. We saw this empirically: objdump showed no
+ * `call recurse` inside recurse(), and unwinders only saw 1 recurse frame.
+ *
+ * To force a real call per level, we put a memory-clobbering inline asm
+ * between the recursive call and the post-call work. The "+r"(r) tells
+ * gcc the asm reads AND writes `r`, and "memory" forbids reordering
+ * memory accesses across it. That's an opaque side effect bound to the
+ * call's return value, which defeats both plain TCO and the modulo-add
+ * transformation.
+ */
 static int __attribute__((noinline)) recurse(int depth, bench_fn_t fn, int iters)
 {
     if (depth <= 0) {
         return fn(iters);
     }
-    /* Pass through volatile to defeat tail-call optimisation, otherwise
-     * the recursion collapses and we lose the deep chain we want to walk. */
-    volatile int d = depth - 1;
-    int r = recurse(d, fn, iters);
+    int r = recurse(depth - 1, fn, iters);
+    __asm__ __volatile__("" : "+r"(r) : : "memory");
     return r + 1;
 }
 
@@ -62,6 +82,7 @@ static int __attribute__((noinline)) do_glibc_backtrace(int iters)
     }
     /* publish to defeat DCE */
     g_sink_n = n;
+    g_actual_frames = n;
     for (int i = 0; i < n; i++) g_sink_buf[i] = buf[i];
     return n;
 }
@@ -74,6 +95,7 @@ static int __attribute__((noinline)) do_fast_backtrace(int iters)
         n = fast_backtrace(buf, MAX_FRAMES);
     }
     g_sink_n = n;
+    g_actual_frames = n;
     for (int i = 0; i < n; i++) g_sink_buf[i] = buf[i];
     return n;
 }
@@ -120,13 +142,13 @@ static double bench(const char *name, int depth, int iters, bench_fn_t fn)
     recurse(depth, fn, 1000);
 
     uint64_t t0 = now_ns();
-    int n = recurse(depth, fn, iters);
+    (void)recurse(depth, fn, iters);
     uint64_t t1 = now_ns();
 
     double total_ns = (double)(t1 - t0);
     double per_call = total_ns / (double)iters;
-    printf("  %-22s depth=%-3d iters=%-9d  %9.1f ns/call  (frames=%d, total=%.2f ms)\n",
-           name, depth, iters, per_call, n, total_ns / 1e6);
+    printf("  %-22s depth=%-3d iters=%-9d  %9.1f ns/call  (actual_frames=%d, total=%.2f ms)\n",
+           name, depth, iters, per_call, g_actual_frames, total_ns / 1e6);
     return per_call;
 }
 
