@@ -61,7 +61,20 @@ typedef int (*bench_fn_t)(int iters);
  * call's return value, which defeats both plain TCO and the modulo-add
  * transformation.
  */
-static int __attribute__((noinline)) recurse(int depth, bench_fn_t fn, int iters)
+/*
+ * The bench/correctness functions are intentionally NOT static and are
+ * tagged externally_visible. backtrace_symbols() resolves names through
+ * dladdr(3), which only sees the dynamic symbol table (.dynsym). With
+ * -rdynamic on the link line, *global* symbols are exported into .dynsym
+ * and become visible to dladdr. Static functions never make it there
+ * (they only live as local entries in .symtab) and would resolve to
+ * just "./bench_backtrace(+offset)". Making them extern + visible
+ * fixes the symbolic backtrace output.
+ */
+#define BENCH_API __attribute__((noinline, visibility("default")))
+
+int BENCH_API recurse(int depth, bench_fn_t fn, int iters);
+int BENCH_API recurse(int depth, bench_fn_t fn, int iters)
 {
     if (depth <= 0) {
         return fn(iters);
@@ -73,7 +86,8 @@ static int __attribute__((noinline)) recurse(int depth, bench_fn_t fn, int iters
 
 /* ----- benchmark bodies --------------------------------------------- */
 
-static int __attribute__((noinline)) do_glibc_backtrace(int iters)
+int BENCH_API do_glibc_backtrace(int iters);
+int BENCH_API do_glibc_backtrace(int iters)
 {
     void *buf[MAX_FRAMES];
     int n = 0;
@@ -87,7 +101,8 @@ static int __attribute__((noinline)) do_glibc_backtrace(int iters)
     return n;
 }
 
-static int __attribute__((noinline)) do_fast_backtrace(int iters)
+int BENCH_API do_fast_backtrace(int iters);
+int BENCH_API do_fast_backtrace(int iters)
 {
     void *buf[MAX_FRAMES];
     int n = 0;
@@ -102,7 +117,8 @@ static int __attribute__((noinline)) do_fast_backtrace(int iters)
 
 /* ----- correctness check (one shot, prints both stacks) ------------- */
 
-static int __attribute__((noinline)) capture_glibc(int iters)
+int BENCH_API capture_glibc(int iters);
+int BENCH_API capture_glibc(int iters)
 {
     (void)iters;
     void *buf[MAX_FRAMES];
@@ -117,7 +133,8 @@ static int __attribute__((noinline)) capture_glibc(int iters)
     return n;
 }
 
-static int __attribute__((noinline)) capture_fast(int iters)
+int BENCH_API capture_fast(int iters);
+int BENCH_API capture_fast(int iters)
 {
     (void)iters;
     void *buf[MAX_FRAMES];
@@ -136,7 +153,7 @@ static int __attribute__((noinline)) capture_fast(int iters)
 
 /* ----- timing harness ----------------------------------------------- */
 
-static double bench(const char *name, int depth, int iters, bench_fn_t fn)
+static double __attribute__((noinline)) bench(const char *name, int depth, int iters, bench_fn_t fn)
 {
     /* warm-up: pages, TLS init, dlopen of libgcc_s.so.1 for glibc path */
     recurse(depth, fn, 1000);

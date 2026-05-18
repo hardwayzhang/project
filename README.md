@@ -156,6 +156,26 @@ LDFLAGS = -rdynamic -pthread                # 让 backtrace_symbols() 能解析�
 > 才把这次优化压住。可以用 `objdump -d bench_backtrace` 查 `<recurse>`
 > 看到真实的 `call recurse` 指令。
 
+> ### 关于 `backtrace_symbols()` 解出的名字只剩 `bench_backtrace(+offset)`
+>
+> `backtrace_symbols()` 内部只用 `dladdr(3)`,而 `dladdr` 只能看到
+> **动态符号表 `.dynsym`**。`-rdynamic` 把全局符号导入 `.dynsym`,
+> 但对 `static` 函数完全无效——它们只在 `.symtab` 里以 local 出现,
+> 因此栈上的返回地址会落在"匿名"区段,只能打印偏移。
+>
+> 因此本仓库里的 bench 辅助函数都不是 `static`,而是带
+> `__attribute__((visibility("default")))` 的全局函数,这样它们就会
+> 进 `.dynsym`,`backtrace_symbols()` 才能解出 `recurse+0xf`、
+> `capture_fast+0x28` 这种真正的函数名。验证:
+>
+> ```bash
+> nm -D bench_backtrace | grep -E ' (recurse|capture_)'
+> ```
+>
+> 想解 static 函数或拿到 `file:line`,需要绕开 `dladdr` ——读 ELF
+> 的 `.symtab` / `.debug_line`(folly `Symbolizer`、absl `Symbolize`、
+> `addr2line` 都是这条路)。
+
 ## 5. 反例:去掉 `-fno-omit-frame-pointer` 会怎样
 
 `make run-nofp` 用 `-fomit-frame-pointer` 重新编译一份 `bench_backtrace_nofp`,
