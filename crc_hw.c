@@ -13,17 +13,22 @@
 #include "crc_hw.h"
 
 #include <string.h>
-#include <cpuid.h>      /* __get_cpuid, bit_SSE4_2 */
 #include <nmmintrin.h>  /* _mm_crc32_u8/u32/u64 (intrinsics carry their own
                          * target("sse4.2") attribute in modern GCC/Clang,
                          * so they're usable without -msse4.2). */
 
+#if !(defined(__GNUC__) || defined(__clang__))
+#  error "crc_hw uses __builtin_cpu_supports, which requires GCC or Clang."
+#endif
+
 /* ----- Detection --------------------------------------------------------- */
 
 static bool detect_sse42_once(void) {
-    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return false;
-    return (ecx & bit_SSE4_2) != 0;
+    /* libgcc's startup constructor normally runs __builtin_cpu_init() already,
+     * but calling it explicitly is documented as safe and makes the code
+     * self-contained (useful for static / freestanding builds). */
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("sse4.2");
 }
 
 bool crc_hw_supported(void) {

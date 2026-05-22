@@ -16,7 +16,8 @@ uint32_t crc32c_hw(uint32_t crc, const void *buf, size_t len);   // requires crc
 uint32_t crc32c_sw(uint32_t crc, const void *buf, size_t len);   // portable fallback / reference
 ```
 
-- `crc_hw_supported()` queries CPUID once and caches the result.
+- `crc_hw_supported()` uses `__builtin_cpu_supports("sse4.2")` under the hood
+  (after `__builtin_cpu_init()`), caches the result, and is thread-safe.
 - `crc32c_hw()` is the *only* function in the project that uses SSE4.2 codegen,
   via `__attribute__((target("sse4.2")))`.
 
@@ -51,7 +52,8 @@ CC=gcc make     # or pin a specific compiler
 ```
 
 Compilation is tested with both **gcc 13** and **clang 18**. The Makefile
-errors out if invoked on a non-x86 host.
+errors out if invoked on a non-x86 host. The detection relies on
+`__builtin_cpu_supports`, so a GCC- or Clang-compatible compiler is required.
 
 ## Run
 
