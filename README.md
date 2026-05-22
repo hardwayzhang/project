@@ -1,35 +1,57 @@
-# crc-hwaccel-test
+# crc-hwaccel-test (x86)
 
 A small Linux test program that detects, functionally verifies and (optionally)
-benchmarks **CRC hardware acceleration** on the current platform.
+benchmarks **CRC hardware acceleration** on **x86 / x86_64**.
 
-## Supported platforms
+The CRC acceleration code is split into a tiny library with a stable C API
+(`crc_hw.h` / `crc_hw.c`) plus a CLI driver (`crc_hwaccel_test.c`).
 
-| Arch         | CRC instructions detected                              |
-|--------------|--------------------------------------------------------|
-| x86 / x86_64 | SSE4.2 `crc32` (CRC32C), `PCLMULQDQ`, AVX/AVX2/AVX-512, `VPCLMULQDQ` |
-| aarch64      | ARMv8-A CRC32 extension (`HWCAP_CRC32`), PMULL         |
-| arm (32-bit) | ARMv8 CRC32 extension (`HWCAP2_CRC32`), PMULL          |
+## Public API
 
-Detection is done via:
-- **x86**: `CPUID` (function 1 ECX bits for SSE4.2/PCLMUL/AVX, leaf 7 EBX/ECX
-  for AVX2/AVX-512F/VPCLMULQDQ).
-- **ARM**: `getauxval(AT_HWCAP)` / `AT_HWCAP2` (the same mechanism the kernel
-  uses to advertise CPU features to userspace).
+```c
+#include "crc_hw.h"
 
-The program then **actually executes** the hardware instruction on the well-
-known CRC32C test vector `"123456789"` (expected value `0xE3069283`) and
-compares it against a portable, table-driven software reference.
+bool     crc_hw_supported(void);                                 // is SSE4.2 CRC32 available?
+uint32_t crc32c_hw(uint32_t crc, const void *buf, size_t len);   // requires crc_hw_supported() == true
+uint32_t crc32c_sw(uint32_t crc, const void *buf, size_t len);   // portable fallback / reference
+```
+
+- `crc_hw_supported()` queries CPUID once and caches the result.
+- `crc32c_hw()` is the *only* function in the project that uses SSE4.2 codegen,
+  via `__attribute__((target("sse4.2")))`.
+
+Typical usage:
+
+```c
+static uint32_t (*crc32c)(uint32_t, const void *, size_t);
+
+void crc32c_init(void) {
+    crc32c = crc_hw_supported() ? crc32c_hw : crc32c_sw;
+}
+```
+
+## Build philosophy: no global ISA flags
+
+The Makefile compiles every translation unit at the **baseline x86 ISA** — no
+`-msse4.2`, no `-mpclmul`, no `-mavx`. Only `crc32c_hw` opts in to SSE4.2 via
+the function-level `target` attribute, so:
+
+- The resulting binary still runs on older x86 CPUs without SSE4.2.
+- Other functions cannot accidentally use SSE4.2 intrinsics.
+- Build flags stay clean and don't get "polluted" with instruction-set switches.
+
+You can verify this with `objdump -d`: the `crc32` opcode appears only inside
+`<crc32c_hw>` and nowhere else.
 
 ## Build
 
 ```
-make
+make            # build with the default compiler (cc)
+CC=gcc make     # or pin a specific compiler
 ```
 
-The `Makefile` automatically adds the appropriate `-march`/`-m...` flags for
-the host architecture (`-msse4.2 -mpclmul` on x86, `-march=armv8-a+crc+crypto`
-on aarch64, etc.).
+Compilation is tested with both **gcc 13** and **clang 18**. The Makefile
+errors out if invoked on a non-x86 host.
 
 ## Run
 
@@ -39,40 +61,29 @@ on aarch64, etc.).
 ./crc_hwaccel_test --help
 ```
 
-### Example output (x86_64 with SSE4.2 + PCLMULQDQ + AVX-512)
+### Example output (x86_64 with SSE4.2)
 
 ```
 Platform: x86_64
-CPU features relevant for CRC acceleration:
-  SSE4.2 (CRC32)         : YES  - CRC32C instruction
-  PCLMULQDQ              : YES  - folding-based CRC
-  AVX                    : YES
-  AVX2                   : YES
-  AVX-512F               : YES
-  VPCLMULQDQ             : YES  - wide folding CRC
-
-Summary: hardware CRC acceleration ... AVAILABLE
+crc_hw_supported() -> true (SSE4.2 CRC32 available)
 
 Self-test (CRC32C of "123456789", expected=0xe3069283):
-  impl     : x86 SSE4.2 CRC32C
-  result   : 0xe3069283
-  status   : PASS
+  software : 0xe3069283   PASS
+  hardware : 0xe3069283   PASS
 
 Benchmark (buffer=1048576 B, iterations=256, total=256 MiB)
-  software CRC32C       :   473.27 MiB/s
-  x86 SSE4.2 CRC32C     : 10112.34 MiB/s
-  speedup (hw / sw)     : 21.37x
+  software CRC32C       :   463.87 MiB/s
+  x86 SSE4.2 CRC32C     :  9725.52 MiB/s
+  speedup (hw / sw)     : 20.97x
 
-OK: CRC hardware acceleration is supported and verified on this platform.
+Result: CRC hardware acceleration supported and verified.
 ```
 
 ## Exit codes
 
-| Code | Meaning                                                                 |
-|------|-------------------------------------------------------------------------|
-| 0    | Hardware CRC acceleration is supported **and** the self-test passed.   |
-| 1    | No CRC hardware acceleration detected on this platform.                |
-| 2    | Hardware was advertised but the self-test FAILED (suspicious CPU/OS).  |
-| 3    | Invalid command-line arguments.                                        |
-
-These make it convenient to use the program in scripts / CI checks.
+| Code | Meaning                                                           |
+|------|-------------------------------------------------------------------|
+| 0    | HW CRC32C supported **and** self-test passed.                     |
+| 1    | HW CRC32C not supported on this CPU.                              |
+| 2    | HW advertised but self-test FAILED (or sw reference is broken).   |
+| 3    | Invalid command-line arguments.                                   |
