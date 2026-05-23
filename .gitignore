@@ -1,0 +1,11 @@
+# Pyroscope server runtime artifacts
+pyroscope/bin/
+pyroscope/data/
+pyroscope/server.log
+
+# Go build/test artifacts
+memdemo/memdemo
+memdemo/heap.pprof
+memdemo/heap.pprof.bak
+memdemo/heap.pprof.gz
+memdemo/heap_uncompressed.pprof
