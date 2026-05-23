@@ -13,13 +13,24 @@ by this dev environment.
 
 ## Download the binary
 
+The easiest way is to run the top-level bootstrap script — it picks the right
+OS/arch tarball, extracts it, makes `pyroscope/data/{local,shared}` and (if
+`go` is on `PATH`) also builds the Go demo:
+
 ```bash
-mkdir -p pyroscope/bin
+./setup.sh                          # from the repository root
+PYROSCOPE_VERSION=1.14.0 ./setup.sh # pin a specific version
+PYROSCOPE_ARCH=arm64 ./setup.sh     # cross-arch override
+```
+
+Equivalent manual steps:
+
+```bash
+mkdir -p pyroscope/bin pyroscope/data/local pyroscope/data/shared
 curl -fsSL -o /tmp/pyroscope.tar.gz \
   https://github.com/grafana/pyroscope/releases/download/v1.14.0/pyroscope_1.14.0_linux_amd64.tar.gz
 tar -xzf /tmp/pyroscope.tar.gz -C /tmp pyroscope
-mv /tmp/pyroscope pyroscope/bin/pyroscope
-chmod +x pyroscope/bin/pyroscope
+install -m 0755 /tmp/pyroscope pyroscope/bin/pyroscope
 pyroscope/bin/pyroscope -version
 ```
 
