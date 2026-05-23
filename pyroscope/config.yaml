@@ -1,0 +1,30 @@
+# Minimal single-node Pyroscope (v1.x) configuration.
+# Stores all blocks on the local filesystem and serves the web UI on :4040.
+
+target: all
+multitenancy_enabled: false
+
+server:
+  http_listen_address: 0.0.0.0
+  http_listen_port: 4040
+  grpc_listen_address: 0.0.0.0
+  grpc_listen_port: 9095
+  log_level: info
+
+self_profiling:
+  disable_push: true
+
+pyroscopedb:
+  data_path: /workspace/pyroscope/data/local
+
+storage:
+  backend: filesystem
+  filesystem:
+    dir: /workspace/pyroscope/data/shared
+
+memberlist:
+  bind_addr: ["127.0.0.1"]
+  bind_port: 7946
+
+analytics:
+  reporting_enabled: false
