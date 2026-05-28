@@ -1,0 +1,13 @@
+[project]
+name = "mprof2pprof"
+version = "0.1.0"
+description = "Offline converter for UE4 MallocProfiler (.mprof) dumps into pprof JSON."
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.scripts]
+mprof2pprof = "mprof2pprof.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mprof2pprof*"]
