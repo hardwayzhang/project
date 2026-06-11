@@ -103,8 +103,101 @@ ASAN_OPTIONS=log_path=asan.log ./bin/double_free
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:abort_on_error=1 ./bin/memory_leak
 ```
 
-如需让栈回溯显示符号（函数名/行号）而非仅有地址，可设置
-`ASAN_SYMBOLIZER_PATH` 指向 `llvm-symbolizer`，或安装 `binutils`（gcc 默认即可）。
+## 问题一：把 ASan 错误日志写入文件（而非输出到终端）
+
+ASan 默认把报告写到 **stderr（fd 2）**。要改为写入文件，推荐用
+`ASAN_OPTIONS=log_path=<前缀>`，运行时会生成 `<前缀>.<pid>` 文件，
+并且 **不再向终端打印**：
+
+```bash
+# 生成 ./asan.log.<pid>，终端保持干净
+ASAN_OPTIONS=log_path=asan.log ./bin/heap_buffer_overflow
+
+# 也可写到绝对路径目录
+ASAN_OPTIONS=log_path=/var/log/myapp/asan.log ./bin/heap_buffer_overflow
+```
+
+相关可选项：
+
+| 选项 | 作用 |
+| --- | --- |
+| `log_path=前缀` | 报告写入 `前缀.<pid>`，不再输出到 stderr |
+| `log_exe_name=1` | 文件名中加入可执行文件名，便于区分多个程序 |
+| `log_to_syslog=1` | 写入 syslog |
+
+> 为什么不直接用 `2> file` 重定向？也可以，但当程序自身还会往 stderr
+> 打印业务日志时会混在一起；`log_path` 能把 ASan 报告单独隔离到独立文件，
+> 且每个进程一个文件，更适合多进程/服务场景。
+
+实测：使用 `log_path` 后终端无任何 ASan 输出，报告完整写入文件：
+
+```text
+$ ASAN_OPTIONS=log_path=/tmp/asan_demo.log ./bin/heap_buffer_overflow
+(终端无 ASan 输出)
+$ cat /tmp/asan_demo.log.*
+==9496==ERROR: AddressSanitizer: heap-buffer-overflow ...
+    #0 0x... in main src/heap_buffer_overflow.c:24
+```
+
+## 问题二：让报告带上文件名/行号（符号信息）的最佳实践
+
+如果报告里栈帧只有裸地址，例如：
+
+```text
+#0 0x5114b1  (/.../bin/heap_buffer_overflow+0x5114b1)
+```
+
+说明 **符号化（symbolization）没有生效**。最佳实践按重要性排序如下：
+
+1. **编译时必须带 `-g`（且不要 strip 可执行文件）。**
+   这是行号的来源。即使符号器可用，缺了 `-g` 也只能得到函数名、得不到
+   `文件:行号`。本仓库 Makefile 已默认带 `-g`。
+
+2. **保留默认的 `symbolize=1`，不要关掉。**
+   `ASAN_OPTIONS=symbolize=0` 会强制只打印裸地址（常见于复现这种现象）。
+
+3. **保证运行环境能找到一个“符号器”：**
+   - **GCC**：其 `libasan` 内置 `libbacktrace`，只要二进制带 `-g`，
+     **无需任何外部工具** 就能直接打印 `文件:行号`（本仓库即如此）。
+   - **Clang**：依赖外部的 `llvm-symbolizer`。需安装 LLVM 工具链，
+     并确保它在 `PATH` 中，或显式指定：
+     ```bash
+     export ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer)
+     ./your_program
+     ```
+
+4. **`-fno-omit-frame-pointer`**：让调用栈回溯更完整、准确（本仓库已带）。
+
+### 已经拿到“只有地址”的旧日志怎么办？离线还原行号
+
+很多线上场景日志早已生成、且只有 `(可执行文件+偏移)`。
+只要你 **手里有那个带 `-g` 的同一份二进制**，就能离线还原：
+
+方法 A：`addr2line`（binutils 自带，最通用）
+
+```bash
+# 偏移取自报告中 (binary+0xXXXX) 的 0xXXXX
+addr2line -f -e bin/heap_buffer_overflow 0x13db
+# 输出:
+#   main
+#   /workspace/asan-demo/src/heap_buffer_overflow.c:24
+```
+
+方法 B：`llvm-symbolizer`（若已安装）
+
+```bash
+echo 'bin/heap_buffer_overflow 0x13db' | llvm-symbolizer
+```
+
+方法 C：LLVM 自带的 `asan_symbolize.py`，可直接把整段日志管道进去自动替换：
+
+```bash
+cat asan.log.1234 | asan_symbolize.py
+```
+
+> 注意：对 PIE（位置无关可执行文件）而言，报告里 `(binary+偏移)` 的 **偏移**
+> 已经是相对二进制基址的值，可直接喂给 `addr2line`；不要用运行时的绝对
+> 地址（如 `0x5114b1`）去查，那个会因 ASLR 每次不同。
 
 ## 如何读懂 ASan 报告
 
@@ -150,7 +243,10 @@ SUMMARY: AddressSanitizer: heap-use-after-free src/heap_use_after_free.c:20 in m
 - **链接报错找不到 `libclang_rt.asan`**：说明 `cc` 指向的 clang 缺少
   sanitizer 运行时。改用 gcc（`make CC=gcc`）或安装对应运行时即可。
 - **内存泄漏没有被检测到**：加上 `ASAN_OPTIONS=detect_leaks=1`。
-- **报告里只有地址没有行号**：确认编译时带了 `-g`，并安装了符号化工具。
+- **报告里只有地址没有行号**：见上文「问题二」。先确认编译带 `-g` 且未
+  `strip`；GCC 无需外部工具，Clang 需 `llvm-symbolizer` 在 `PATH` 中；
+  旧日志可用 `addr2line -f -e <二进制> <偏移>` 离线还原。
+- **想把报告写入文件**：见上文「问题一」，用 `ASAN_OPTIONS=log_path=前缀`。
 - **ASan 与 Valgrind 的关系**：两者都能查内存错误。ASan 需要重新编译、
   运行开销更小（约 2 倍）、能精准定位到行；Valgrind 无需重编译但更慢。
   实践中常优先用 ASan。
