@@ -14,10 +14,15 @@
 
 # 默认使用 gcc（注意：make 的内置默认 CC=cc，故这里用 := 强制覆盖；
 # 命令行 `make CC=clang` 仍可正常覆盖本设置）。
-CC      := gcc
-CFLAGS  ?= -fsanitize=address -fno-omit-frame-pointer -g -O1 -Wall -Wextra
-SRC_DIR := src
-BIN_DIR := bin
+CC         := gcc
+CFLAGS     ?= -fsanitize=address -fno-omit-frame-pointer -g -O1 -Wall -Wextra
+SRC_DIR    := src
+COMMON_DIR := common
+BIN_DIR    := bin
+
+# 公共源文件（如 __asan_default_options 的定义）会链接进每个示例，
+# 这样运行时无需再设置 ASAN_OPTIONS 环境变量。
+COMMON_SRCS := $(wildcard $(COMMON_DIR)/*.c)
 
 SRCS := $(wildcard $(SRC_DIR)/*.c)
 BINS := $(patsubst $(SRC_DIR)/%.c,$(BIN_DIR)/%,$(SRCS))
@@ -29,8 +34,8 @@ all: $(BINS)
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
-$(BIN_DIR)/%: $(SRC_DIR)/%.c | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $<
+$(BIN_DIR)/%: $(SRC_DIR)/%.c $(COMMON_SRCS) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(COMMON_SRCS)
 
 run: all
 	@./run_demo.sh

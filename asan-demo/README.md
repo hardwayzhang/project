@@ -20,6 +20,8 @@ asan-demo/
 ├── Makefile                 # 用 -fsanitize=address 编译所有示例
 ├── run_demo.sh              # 一键编译并依次运行全部示例
 ├── README.md               # 本文档
+├── common/
+│   └── asan_default_options.c   # 定义 __asan_default_options()，内置默认选项
 └── src/
     ├── correct_example.c        # 正确示例：无任何报错（对照组）
     ├── heap_buffer_overflow.c   # 堆缓冲区溢出
@@ -27,7 +29,8 @@ asan-demo/
     ├── stack_buffer_overflow.c  # 栈缓冲区溢出
     ├── global_buffer_overflow.c # 全局缓冲区溢出
     ├── double_free.c            # 重复释放
-    └── memory_leak.c            # 内存泄漏
+    ├── memory_leak.c            # 内存泄漏
+    └── fork_child_overflow.c    # 父进程 fork 子进程，子进程越界
 ```
 
 ## 环境要求
@@ -102,6 +105,76 @@ ASAN_OPTIONS=log_path=asan.log ./bin/double_free
 # 多项组合用冒号分隔
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:abort_on_error=1 ./bin/memory_leak
 ```
+
+## 推荐：用 `__asan_default_options` 把默认选项编进程序
+
+每次都靠环境变量 `ASAN_OPTIONS` 容易忘记设置（例如忘了 `detect_leaks=1`
+就漏掉泄漏检测）。更稳妥的做法是 **在程序里定义弱符号函数
+`__asan_default_options()`**，ASan 启动时会自动调用它取得默认配置：
+
+```c
+/* common/asan_default_options.c */
+const char *__asan_default_options(void) {
+    return "detect_leaks=1"      /* 开启内存泄漏检测 */
+           ":halt_on_error=1"    /* 遇到第一个错误即停止 */
+           ":abort_on_error=0";  /* 用退出码结束而非 abort 信号 */
+}
+```
+
+只要把这个文件链接进可执行程序（本仓库 Makefile 已对每个示例自动链接），
+运行时就 **无需再设置 `ASAN_OPTIONS`**：
+
+```bash
+# 不带任何环境变量，泄漏检测依然生效（来自 __asan_default_options）
+./bin/memory_leak
+```
+
+**优先级（后者覆盖前者）：**
+
+```
+编译内置默认  <  __asan_default_options()  <  运行时 ASAN_OPTIONS 环境变量
+```
+
+也就是说，内置默认值随时可被环境变量临时覆盖，便于调试：
+
+```bash
+# 临时关掉泄漏检测，覆盖掉 __asan_default_options 里的 detect_leaks=1
+ASAN_OPTIONS=detect_leaks=0 ./bin/memory_leak   # 不再报告泄漏
+```
+
+> 小贴士：同理还有 `__lsan_default_options()`（LeakSanitizer）、
+> `__lsan_default_suppressions()`（泄漏白名单）、
+> `__ubsan_default_options()`（UBSan）等弱符号函数可用。
+
+## 父子进程示例：子进程越界（fork）
+
+`src/fork_child_overflow.c` 演示 **ASan 在 fork 出来的子进程中同样有效**：
+
+- 父进程 `fork()` 出子进程；
+- 子进程进行堆越界写入，被 ASan 捕获并报告 `heap-buffer-overflow`；
+- 因 `abort_on_error=0`，子进程以非 0 退出码结束（而非被信号杀死）；
+- 父进程通过 `waitpid` 读取子进程的异常退出状态，自己正常结束。
+
+运行（无需设置环境变量）：
+
+```bash
+./bin/fork_child_overflow
+```
+
+预期输出（节选）：
+
+```text
+[parent ...] 即将 fork 子进程
+[child  ...] 分配 4 个 int，准备越界写入下标 8
+==PID==ERROR: AddressSanitizer: heap-buffer-overflow ...
+    #0 ... in child_work src/fork_child_overflow.c:30
+[parent ...] 子进程(...) 以退出码 1 结束（非 0，说明子进程被 ASan 终止）
+[parent ...] 父进程自身没有内存错误，正常退出
+```
+
+> 多进程/多线程下若多个进程同时报错，stderr 上的报告可能交错。
+> 此时建议配合 `ASAN_OPTIONS=log_path=asan.log`：每个进程会写到
+> 各自的 `asan.log.<pid>`，按 pid 区分，互不干扰。
 
 ## 问题一：把 ASan 错误日志写入文件（而非输出到终端）
 
@@ -234,6 +307,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free src/heap_use_after_free.c:20 in m
 | `global_buffer_overflow` | global-buffer-overflow | 非 0 |
 | `double_free` | attempting double-free | 非 0 |
 | `memory_leak` | LeakSanitizer: detected memory leaks | 非 0 |
+| `fork_child_overflow` | 子进程 heap-buffer-overflow（父进程正常退出） | 0（父进程） |
 
 > 注：示例中对越界下标使用了 `volatile`，目的是防止编译器在优化阶段
 > 直接把越界访问消除掉，从而保证 ASan 一定能在运行时捕获到错误。

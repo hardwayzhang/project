@@ -11,9 +11,10 @@ set -u
 CC="${CC:-gcc}"
 BIN_DIR="bin"
 
-# 开启内存泄漏检测（部分平台/编译器默认未开启）。
-# halt_on_error=1 表示遇到第一个错误就停止该进程（默认行为）。
-export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1}"
+# 注意：默认的 ASan 选项（如 detect_leaks=1）已通过
+# common/asan_default_options.c 里的 __asan_default_options() 编进程序，
+# 这里不再设置 ASAN_OPTIONS 环境变量。
+# 如需临时覆盖，运行时仍可 `ASAN_OPTIONS=... ./run_demo.sh`。
 
 if [ ! -d "$BIN_DIR" ]; then
     echo "未找到 $BIN_DIR 目录，请先执行: make"
@@ -38,7 +39,8 @@ run_one() {
 }
 
 echo "使用编译器: $CC"
-echo "ASAN_OPTIONS=$ASAN_OPTIONS"
+echo "默认 ASan 选项来自 __asan_default_options() (见 common/asan_default_options.c)"
+echo "ASAN_OPTIONS(环境变量)=${ASAN_OPTIONS:-<未设置, 使用程序内置默认>}"
 echo
 
 run_one correct_example
@@ -48,6 +50,7 @@ run_one stack_buffer_overflow
 run_one global_buffer_overflow
 run_one double_free
 run_one memory_leak
+run_one fork_child_overflow
 
 echo "=================================================================="
 echo "全部示例运行结束。"
