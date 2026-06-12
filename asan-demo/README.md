@@ -21,7 +21,8 @@ asan-demo/
 ├── run_demo.sh              # 一键编译并依次运行全部示例
 ├── README.md               # 本文档
 ├── common/
-│   └── asan_default_options.c   # 定义 __asan_default_options()，内置默认选项
+│   ├── asan_default_options.c   # 定义 __asan_default_options()，内置默认选项
+│   └── asan_activation.h        # 手动激活/反激活 ASan 的封装（内部符号）
 └── src/
     ├── correct_example.c        # 正确示例：无任何报错（对照组）
     ├── heap_buffer_overflow.c   # 堆缓冲区溢出
@@ -146,14 +147,20 @@ ASAN_OPTIONS=detect_leaks=0 ./bin/memory_leak   # 不再报告泄漏
 > `__lsan_default_suppressions()`（泄漏白名单）、
 > `__ubsan_default_options()`（UBSan）等弱符号函数可用。
 
-## 父子进程示例：子进程越界（fork）
+## 父子进程示例：start_deactivated 启动 + 子进程手动激活（fork）
 
-`src/fork_child_overflow.c` 演示 **ASan 在 fork 出来的子进程中同样有效**：
+`src/fork_child_overflow.c` 演示一个更进阶的用法：**父进程以“未激活”状态
+启动 ASan（`start_deactivated=1`），fork 子进程后在子进程里手动激活检查**。
 
-- 父进程 `fork()` 出子进程；
-- 子进程进行堆越界写入，被 ASan 捕获并报告 `heap-buffer-overflow`；
-- 因 `abort_on_error=0`，子进程以非 0 退出码结束（而非被信号杀死）；
-- 父进程通过 `waitpid` 读取子进程的异常退出状态，自己正常结束。
+流程：
+
+1. 通过自带的 `__asan_default_options()` 设置 `start_deactivated=1`；
+2. 父进程启动后显式调用 `asan_deactivate()`，进入未激活状态（原因见下）；
+3. `fork()` 出子进程，子进程继承未激活状态：
+   - 越界#1（未激活）→ **不被拦截**；
+   - 调用 `asan_activate()` 手动激活；
+   - 越界#2（已激活）→ **被 ASan 捕获并报告**；
+4. 父进程 `waitpid` 读取子进程退出码，自身正常退出。
 
 运行（无需设置环境变量）：
 
@@ -161,20 +168,42 @@ ASAN_OPTIONS=detect_leaks=0 ./bin/memory_leak   # 不再报告泄漏
 ./bin/fork_child_overflow
 ```
 
-预期输出（节选）：
+实测输出（节选）：
 
 ```text
-[parent ...] 即将 fork 子进程
-[child  ...] 分配 4 个 int，准备越界写入下标 8
+[parent ...] 以 start_deactivated=1 启动
+[parent ...] 已显式 asan_deactivate()，当前未激活
+[child  ...] 越界#1（激活前，预期不被拦截）：
+    [deactivated] 写入 arr[8]=4660 成功（说明本次未被 ASan 拦截）
+[child  ...] 手动调用 asan_activate() 激活 ASan 检查
+[child  ...] 越界#2（激活后，预期被 ASan 捕获）：
 ==PID==ERROR: AddressSanitizer: heap-buffer-overflow ...
-    #0 ... in child_work src/fork_child_overflow.c:30
-[parent ...] 子进程(...) 以退出码 1 结束（非 0，说明子进程被 ASan 终止）
-[parent ...] 父进程自身没有内存错误，正常退出
+    #0 ... in do_overflow src/fork_child_overflow.c:48
+[parent ...] 子进程(...) 以退出码 1 结束（非 0，说明激活后被 ASan 终止）
+[parent ...] 父进程自身没有触发检查，正常退出
 ```
 
-> 多进程/多线程下若多个进程同时报错，stderr 上的报告可能交错。
-> 此时建议配合 `ASAN_OPTIONS=log_path=asan.log`：每个进程会写到
-> 各自的 `asan.log.<pid>`，按 pid 区分，互不干扰。
+### 实现要点与注意事项
+
+- **激活/反激活接口**：由运行时内部函数 `__asan::AsanActivate()` /
+  `AsanDeactivate()` 完成，封装在 `common/asan_activation.h` 里的
+  `asan_activate()` / `asan_deactivate()`。**它们不是公开稳定 API**，
+  仅供学习/演示，勿用于生产代码。
+
+- **必须静态链接 ASan 运行时**，否则上述内部符号无法解析：
+  - gcc：加 `-static-libasan`（本示例 Makefile 已自动加）；
+  - clang：默认即静态链接。
+  - 若用 gcc 默认的共享 `libasan.so`，符号不导出，链接会失败。
+
+- **为什么还要显式 `asan_deactivate()`？** `start_deactivated=1` 主要面向
+  “主程序未插桩、运行时随后被加载”的场景（如 Android：dlopen 带插桩的 `.so`
+  时才自动激活）。当主程序本身用 `-fsanitize=address` 插桩时，运行时在启动阶段
+  会因检测到已插桩模块而 **自动激活**，使 `start_deactivated` 看起来“没生效”。
+  因此这里在 `main` 入口再显式反激活一次，才能真正进入未激活状态来演示。
+
+- **多进程日志**：多个进程同时报错时 stderr 上的报告可能交错，建议配合
+  `ASAN_OPTIONS=log_path=asan.log`，每个进程写到各自的 `asan.log.<pid>`，
+  按 pid 区分，互不干扰。
 
 ## 问题一：把 ASan 错误日志写入文件（而非输出到终端）
 

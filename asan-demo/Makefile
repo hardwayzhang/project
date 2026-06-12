@@ -24,6 +24,13 @@ BIN_DIR    := bin
 # 这样运行时无需再设置 ASAN_OPTIONS 环境变量。
 COMMON_SRCS := $(wildcard $(COMMON_DIR)/*.c)
 
+# 允许示例 #include common/ 下的头文件。
+CPPFLAGS += -I$(COMMON_DIR)
+
+# fork_child_overflow 需要静态链接 ASan 运行时，才能引用内部的
+# AsanActivate/AsanDeactivate 符号。gcc 用 -static-libasan；clang 默认即静态。
+STATIC_ASAN_FLAG := $(if $(findstring clang,$(CC)),,-static-libasan)
+
 SRCS := $(wildcard $(SRC_DIR)/*.c)
 BINS := $(patsubst $(SRC_DIR)/%.c,$(BIN_DIR)/%,$(SRCS))
 
@@ -34,8 +41,13 @@ all: $(BINS)
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
+# fork_child_overflow：静态链接 asan，且自带 __asan_default_options，
+# 故不链接 common/ 里的 asan_default_options.c（避免重复定义）。
+$(BIN_DIR)/fork_child_overflow: $(SRC_DIR)/fork_child_overflow.c | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(STATIC_ASAN_FLAG) -o $@ $<
+
 $(BIN_DIR)/%: $(SRC_DIR)/%.c $(COMMON_SRCS) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $< $(COMMON_SRCS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(COMMON_SRCS)
 
 run: all
 	@./run_demo.sh
