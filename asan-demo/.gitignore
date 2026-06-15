@@ -1,3 +1,4 @@
 bin/
 *.o
 asan.log*
+asan_logs/

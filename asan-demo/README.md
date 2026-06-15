@@ -31,7 +31,8 @@ asan-demo/
     ├── global_buffer_overflow.c # 全局缓冲区溢出
     ├── double_free.c            # 重复释放
     ├── memory_leak.c            # 内存泄漏
-    └── fork_child_overflow.c    # 父进程 fork 子进程，子进程越界
+    ├── fork_child_overflow.c    # 父进程 fork 子进程，子进程越界
+    └── fork_log_split.c         # 父/子进程把 ASan 报告写到不同文件
 ```
 
 ## 环境要求
@@ -203,7 +204,64 @@ ASAN_OPTIONS=detect_leaks=0 ./bin/memory_leak   # 不再报告泄漏
 
 - **多进程日志**：多个进程同时报错时 stderr 上的报告可能交错，建议配合
   `ASAN_OPTIONS=log_path=asan.log`，每个进程写到各自的 `asan.log.<pid>`，
-  按 pid 区分，互不干扰。
+  按 pid 区分，互不干扰（下一节有专门示例）。
+
+## 父子进程示例：报告写到不同文件（fork + 分文件）
+
+`src/fork_log_split.c` 演示 **让父进程和子进程把各自的 ASan 报告写到不同文件**，
+避免多进程报告交错在一起。
+
+两种做法：
+
+1. **最简单（环境变量）**：设置 `ASAN_OPTIONS=log_path=asan.log`，ASan 会把每个
+   进程的报告写到 `asan.log.<pid>`。父、子 pid 不同，自然就是不同文件。
+
+2. **代码精确控制（本示例）**：用公开 API
+   `__sanitizer_set_report_path("<前缀>")`（声明在
+   `<sanitizer/common_interface_defs.h>`）在运行时设置报告路径，ASan 写到
+   `<前缀>.<pid>`。父、子各调用一次、传入不同前缀，文件名就能带上各自的角色：
+
+   ```c
+   // 子进程
+   __sanitizer_set_report_path("asan_logs/asan_child");   // -> asan_logs/asan_child.<子pid>
+   // 父进程
+   __sanitizer_set_report_path("asan_logs/asan_parent");  // -> asan_logs/asan_parent.<父pid>
+   ```
+
+运行：
+
+```bash
+./bin/fork_log_split
+```
+
+实测输出（节选）：
+
+```text
+[child  pid=5017] 越界读 arr[8]=0，报告已写入: asan_logs/asan_child.5017
+[parent pid=5016] 越界读 arr[8]=0，报告已写入: asan_logs/asan_parent.5016
+
+[parent] asan_logs/ 目录下生成的 ASan 报告文件：
+    - asan_logs/asan_parent.5016
+    - asan_logs/asan_child.5017
+```
+
+查看具体报告：
+
+```bash
+cat asan_logs/asan_parent.*   # 父进程的 heap-buffer-overflow 报告
+cat asan_logs/asan_child.*    # 子进程的 heap-buffer-overflow 报告
+```
+
+### 实现要点
+
+- **`__sanitizer_set_report_path()` 是公开稳定 API**，可放心使用；配套的
+  `__sanitizer_get_report_path()` 返回实际写入的文件名（已带 `.<pid>`）。
+- 为了让进程“报告完一次错误后还能继续运行”（这样父进程才能在最后列出生成的
+  文件），本示例：
+  - 编译加 `-fsanitize-recover=address`（使 ASan 错误可恢复）；
+  - 运行设 `halt_on_error=0`（报告后不中止）；
+  - 故意用 **越界读**，被记录后继续也不会破坏堆。
+  > 若不需要继续运行，去掉以上两项即可：每个进程报告完后照常中止，文件依旧分开生成。
 
 ## 问题一：把 ASan 错误日志写入文件（而非输出到终端）
 
@@ -337,6 +395,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free src/heap_use_after_free.c:20 in m
 | `double_free` | attempting double-free | 非 0 |
 | `memory_leak` | LeakSanitizer: detected memory leaks | 非 0 |
 | `fork_child_overflow` | 子进程 heap-buffer-overflow（父进程正常退出） | 0（父进程） |
+| `fork_log_split` | 父/子各写一份 heap-buffer-overflow 报告到不同文件 | 0 |
 
 > 注：示例中对越界下标使用了 `volatile`，目的是防止编译器在优化阶段
 > 直接把越界访问消除掉，从而保证 ASan 一定能在运行时捕获到错误。

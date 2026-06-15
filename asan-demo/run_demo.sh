@@ -51,6 +51,7 @@ run_one global_buffer_overflow
 run_one double_free
 run_one memory_leak
 run_one fork_child_overflow
+run_one fork_log_split
 
 echo "=================================================================="
 echo "全部示例运行结束。"

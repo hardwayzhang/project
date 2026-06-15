@@ -46,6 +46,11 @@ $(BIN_DIR):
 $(BIN_DIR)/fork_child_overflow: $(SRC_DIR)/fork_child_overflow.c | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(STATIC_ASAN_FLAG) -o $@ $<
 
+# fork_log_split：用 -fsanitize-recover=address 让报告后可继续，
+# 自带 __asan_default_options，故不链接 common/。
+$(BIN_DIR)/fork_log_split: $(SRC_DIR)/fork_log_split.c | $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fsanitize-recover=address -o $@ $<
+
 $(BIN_DIR)/%: $(SRC_DIR)/%.c $(COMMON_SRCS) | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(COMMON_SRCS)
 
