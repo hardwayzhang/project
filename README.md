@@ -20,8 +20,16 @@ IP **TTL** (time-to-live) field:
    - a generic host returns an ICMP **Destination Unreachable / Port
      Unreachable** (type 3, code 3) message.
 
-The client listens for the ICMP replies on a **raw ICMP socket**, which is why
-it must run as root (or with `CAP_NET_RAW`).
+There are **two client implementations** that differ only in how they read the
+ICMP replies:
+
+- `client.c` — reads ICMP on a **raw ICMP socket**; requires **root** (or
+  `CAP_NET_RAW`).
+- `client_recverr.c` — **needs no privileges**. It uses the Linux `IP_RECVERR`
+  socket option on a plain UDP socket, so the kernel delivers the relevant ICMP
+  errors to the socket's *error queue*, read with `recvmsg(..., MSG_ERRQUEUE)`.
+
+Pick whichever fits your environment; both produce the same hop-by-hop output.
 
 ```
 client  --UDP(TTL=n)-->  [ router1 ] [ router2 ] ... [ server ]
@@ -33,12 +41,13 @@ client  --UDP(TTL=n)-->  [ router1 ] [ router2 ] ... [ server ]
 
 ## Files
 
-| File        | Description                                             |
-|-------------|---------------------------------------------------------|
-| `client.c`  | UDP traceroute client (sends probes, reads ICMP)        |
-| `server.c`  | UDP server that echoes a reply so the last hop is known |
-| `common.h`  | Shared probe format and helpers                         |
-| `Makefile`  | Build rules                                             |
+| File                | Description                                                    |
+|---------------------|----------------------------------------------------------------|
+| `client.c`          | UDP traceroute client using a raw ICMP socket (**needs root**) |
+| `client_recverr.c`  | UDP traceroute client using `IP_RECVERR` (**no root needed**)  |
+| `server.c`          | UDP server that echoes a reply so the last hop is known        |
+| `common.h`          | Shared probe format and helpers                                |
+| `Makefile`          | Build rules                                                    |
 
 ## Build
 
@@ -46,11 +55,25 @@ client  --UDP(TTL=n)-->  [ router1 ] [ router2 ] ... [ server ]
 make
 ```
 
-Produces two binaries: `server` and `client`.
+Produces three binaries: `server`, `client`, and `client_recverr`.
 
 ## Run
 
-### 1. Client + server on the same/known destination
+### Option A — no root required (recommended): `client_recverr`
+
+```sh
+./client_recverr 8.8.8.8
+```
+
+Uses `IP_RECVERR`, so it runs as an ordinary user.
+
+### Option B — raw ICMP socket: `client` (needs root)
+
+```sh
+sudo ./client 8.8.8.8
+```
+
+### With the companion server
 
 Start the server (no privileges required):
 
@@ -58,28 +81,23 @@ Start the server (no privileges required):
 ./server 33434
 ```
 
-Run the client against it (raw ICMP socket needs root):
+Run either client against it; the final hop is confirmed by the server's UDP
+reply:
 
 ```sh
-sudo ./client -p 33434 <server-ip>
+./client_recverr -p 33434 <server-ip>     # no root
+sudo ./client     -p 33434 <server-ip>     # root
 ```
 
-When the destination is the demo server, the final hop is confirmed by the
-server's UDP reply.
-
-### 2. Trace to any host on the Internet
-
-The client also works against ordinary hosts (no server needed); the final hop
-is then detected via the ICMP port-unreachable message:
-
-```sh
-sudo ./client 8.8.8.8
-```
+Against ordinary hosts (no server) the final hop is instead detected via the
+ICMP port-unreachable message.
 
 ## Options
 
+Both clients share the same options:
+
 ```
-Usage: client [-p port] [-m max_hops] [-q nqueries] [-w timeout] host
+Usage: client_recverr [-p port] [-m max_hops] [-q nqueries] [-w timeout] host
   -p port      destination UDP port (default 33434)
   -m max_hops  maximum number of hops (default 30)
   -q nqueries  probes per hop (default 3)
@@ -88,8 +106,12 @@ Usage: client [-p port] [-m max_hops] [-q nqueries] [-w timeout] host
 
 ## Notes
 
-- The raw ICMP socket receives *all* ICMP traffic on the host; the client
-  matches replies to its own probes by inspecting the quoted IP + UDP header
-  carried inside each ICMP error and comparing the destination address and the
-  source/destination UDP ports.
+- **`client.c` (raw socket):** the raw ICMP socket receives *all* ICMP traffic
+  on the host, so the client matches replies to its own probes by inspecting
+  the quoted IP + UDP header carried inside each ICMP error and comparing the
+  destination address and the source/destination UDP ports.
+- **`client_recverr.c` (`IP_RECVERR`):** the kernel only queues errors for
+  datagrams this socket sent, so no manual matching is needed and no elevated
+  privileges are required. The offending router's address comes from
+  `SO_EE_OFFENDER(ee)` in the `IP_RECVERR` control message.
 - IPv4 only, to keep the example short.
