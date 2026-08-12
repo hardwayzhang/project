@@ -670,11 +670,15 @@ static int method1_report(struct method1_watch *w, struct config *cfg)
     describe_status(w->status, desc, sizeof(desc));
 
     /*
-     * perf record 收到 SIGINT 后应当写出 perf.data。缺少该文件说明记录阶段
-     * 出了问题, 此时回放记录日志而不是只报一句 "找不到 perf.data"。
+     * perf record 收到 SIGINT 后应当写出 perf.data。这里用 stat() 判断"存在且
+     * 非空", 而不是 access(R_OK): 经由 sudo 录制时 perf.data 可能一度是 root:0600,
+     * 属主由脚本改回调用用户; 即便属主修正失败, 后续分析仍走 sudo perf script,
+     * 因此只要文件已生成就继续, 不因当前进程读不到而误判为失败。
      */
-    if (access(w->datapath, R_OK) != 0) {
-        printf("\n[方式一][失败] 未生成 %s (%s)\n", w->datapath, strerror(errno));
+    struct stat sb;
+    if (stat(w->datapath, &sb) != 0 || sb.st_size == 0) {
+        printf("\n[方式一][失败] 未生成有效的 %s (%s)\n", w->datapath,
+               stat(w->datapath, &sb) != 0 ? strerror(errno) : "文件为空");
         printf("  记录进程结束情况: %s\n", desc);
         dump_log(w->logpath, "记录阶段输出");
         printf("  常见原因:\n");
@@ -688,6 +692,11 @@ static int method1_report(struct method1_watch *w, struct config *cfg)
         printf("    %s record --pid <PID> --out <DIR>\n", cfg->script);
         return -1;
     }
+
+    /* 文件已生成但当前用户读不到: 属主修正可能失败, 交给 sudo perf script 处理 */
+    if (access(w->datapath, R_OK) != 0)
+        printf("\n[方式一] 提示: 当前用户暂不能直接读取 %s, 将通过 perf 读取分析。\n",
+               w->datapath);
 
     if (cfg->verbose) {
         printf("\n[方式一] 记录进程结束情况: %s\n", desc);

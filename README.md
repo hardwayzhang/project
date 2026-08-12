@@ -90,6 +90,13 @@ sudo -n perf report ...
 3. tracefs 已挂载，内核启用了 kprobe/ftrace；
 4. `do_wp_page` 可探测。
 
+### perf.data 属主
+
+经由 `sudo -n perf` 录制时，`perf.data` 会由 root 创建（`root:root 0600`），非 root 的
+`cow_demo` 直接读不到。report 阶段会用 `sudo -n chown` 把它改回调用用户（失败时退化为
+`chmod a+r`），因此分析可以正常进行，文件之后也能被你手动查看。`cow_demo` 对
+`perf.data` 的判定基于“存在且非空”，不因当前进程一时读不到而误报失败。
+
 记录阶段的全部 stdout/stderr 写入 `<outdir>/record.log`。以下情况都会回放日志并
 让 `cow_demo` 以非零状态退出：
 
@@ -201,6 +208,12 @@ sudo -n perf --version
 ```
 
 若仍失败，检查 sudoers 的命令规则和 `secure_path`。
+
+### 方式一：`perf.data` 存在但报 Permission denied
+
+这是早期版本的问题：`sudo -n perf` 生成的 `perf.data` 是 `root:0600`，而非 root 的
+`cow_demo` 在分析前直接读它被拒。现在 report 阶段会先 `sudo -n chown` 修回属主，
+判定也改为“存在且非空”，因此该情况已被处理。
 
 ### 方式一：没有 `perf.data`
 

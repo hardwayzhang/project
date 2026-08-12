@@ -127,8 +127,9 @@ cmd_record() {
 
     log "[方式一] 开始记录子进程用户态调用栈:"
     log "         perf record --user-callchains -e $PROBE_NAME -g -p $PID -o $OUT/perf.data"
-    # 前台运行; 收到 SIGINT 时 perf 会停止并写出 perf.data。
-    # 用 exec 让 SIGINT 直达 perf。
+    # 用 exec 让调用方发来的 SIGINT 直达 perf, 由 perf 自己收尾写出 perf.data
+    # (这是最可靠的停止路径)。若经由 sudo 运行, perf 以 root 身份创建的
+    # perf.data 会是 root:0600, 其属主由 report 阶段负责改回调用用户。
     if [ "$USE_SUDO" -eq 1 ]; then
         exec sudo -n perf record --user-callchains -e "$PROBE_NAME" -g -p "$PID" \
             -o "$OUT/perf.data"
@@ -154,9 +155,21 @@ cmd_report() {
 
     need_perf
 
+    # perf.data 可能由 sudo 下的 perf 以 root:0600 生成, 非 root 的调用方读不到。
+    # 这里把属主改回调用用户(即运行本脚本的 cow_demo 用户), 使其可直接读取/留存;
+    # chown 失败时退化为 chmod a+r。已可读则跳过。
+    if [ ! -r "$DATA" ] && [ "$USE_SUDO" -eq 1 ]; then
+        if sudo -n chown "$(id -u):$(id -g)" "$DATA" 2>/dev/null; then
+            log "[方式一] 已将 $DATA 属主改为 uid=$(id -u)。"
+        elif sudo -n chmod a+r "$DATA" 2>/dev/null; then
+            log "[方式一] 已放宽 $DATA 为全体可读。"
+        else
+            log "[方式一] 无法修正 $DATA 权限, 将继续用 sudo perf 读取分析。"
+        fi
+    fi
+
     echo "---------------- 子进程用户态调用栈 (perf script) ----------------"
     # 记录阶段使用 --user-callchains, perf.data 中不包含内核调用链。
-    need_perf
     run_perf script -i "$DATA" 2>/dev/null > "$OUT/script.txt" || true
     if [ -s "$OUT/script.txt" ]; then
         # 打印前 3 个样本块(以空行分隔)
