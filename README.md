@@ -86,6 +86,28 @@ scripts/perf_cow_watch.sh record --pid <PID> --out <DIR>
 scripts/perf_cow_watch.sh report --out <DIR> --pages <N>
 ```
 
+### 失败诊断
+
+记录阶段的全部输出（包括 `perf probe` 与 `perf record` 的原始报错）会写入
+`<输出目录>/record.log`。方式一失败时，程序会直接回放该日志，而不是只报告
+“找不到 perf.data”，并给出记录进程的退出状态与常见原因：
+
+```text
+[方式一][失败] 未生成 /tmp/cow_demo_perfXXXX/perf.data (No such file or directory)
+  记录进程结束情况: 被信号终止, signal=2 (SIGINT, 即本程序发出的正常停止信号)
+  ---- 记录阶段输出 (/tmp/cow_demo_perfXXXX/record.log) ----
+  | [方式一] perf probe --add do_wp_page
+  | Permission denied
+  ---- 日志结束 ----
+  常见原因:
+    1) perf probe --add do_wp_page 失败 (无 root/CAP_PERFMON, 或 tracefs kprobe_events 不可写);
+    ...
+```
+
+失败分两种情况：记录进程在热身期内就退出（通常是 `perf` 缺失或 `perf probe` 失败），
+以及记录进程正常运行但没有产出 `perf.data`。两种情况都会回放日志，并让 `cow_demo`
+以非零状态退出。加 `--verbose` 可在成功时也打印该日志。
+
 ## 方式二
 
 方式二不调用 `perf` 命令：
@@ -113,8 +135,36 @@ cow_touch_pages → child_main → main → __libc_start_main → _start
 ```
 
 回退后端订阅 `PERF_COUNT_SW_PAGE_FAULTS`，仍使用相同的环形缓冲与用户态调用栈
-采集逻辑。它统计所有子进程缺页，因此可能比实际 COW 页数略多。默认 `auto` 会先尝试
-kprobe，失败后自动回退。
+采集逻辑。默认 `auto` 会先尝试 kprobe，失败后自动回退。
+
+发生回退时程序会打印具体原因，例如：
+
+```text
+ [告警] 未能使用 do_wp_page kprobe, 已回退到软件缺页后端。
+ [回退原因] 未找到 tracefs (已尝试 /proc/mounts、/sys/kernel/tracing、
+            /sys/kernel/debug/tracing); 内核可能未启用 ftrace/kprobe, 或容器未挂载 tracefs
+ [tracefs]   未找到
+```
+
+可能的回退原因包括：tracefs 未挂载；`kprobe_events` 打开或写入失败（`EACCES`
+表示缺少 root/ACL，`ENOENT`/`EINVAL` 表示符号不可探测）；事件 id 读取失败；
+tracepoint 的 `perf_event_open` 被 `perf_event_paranoid` 拒绝。
+
+#### 两种事件源的语义区别
+
+| | `do_wp_page` kprobe | `PERF_COUNT_SW_PAGE_FAULTS` |
+| --- | --- | --- |
+| 触发条件 | 只在写入“已存在但只读”的页时触发 | 进程的任意缺页都触发 |
+| 与 COW 的关系 | 一次事件对应一次真实页复制 | 包含 COW，也包含非复制类缺页 |
+| 统计精度 | 精确 | 近似，偏大 |
+
+`do_wp_page()` 是内核的写保护缺页处理函数，正是 `fork` 之后的 COW 路径，所以
+`事件数 × 页大小` 就是 COW 内存量。而软件缺页事件还会统计首次访问匿名页
+（`do_anonymous_page`）、文件页读入（`filemap_fault`）、栈扩展等并不发生页复制的缺页。
+
+本 demo 中子进程只对 `fork` 前已驻留的私有页逐页写入，绝大多数缺页就是 COW，因此
+缺页数约等于 COW 数；但仍会多出少量非 COW 缺页（例如子进程首次执行 libc 代码路径），
+统计值因此略微偏大。
 
 ## 非 root 最小权限
 

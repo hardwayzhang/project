@@ -41,18 +41,26 @@ need_perf() {
     command -v perf >/dev/null 2>&1 || die "未找到 perf, 请先安装 (linux-tools)。"
 }
 
-# 确保 do_wp_page 探针存在(幂等)
+# 确保 do_wp_page 探针存在(幂等)。
+# 这里不屏蔽 perf 的输出: record 模式下调用方会把 stdout/stderr 收集到
+# <out>/record.log, 失败时需要这些信息来定位原因。
 add_probe() {
     need_perf
-    if perf probe -l 2>/dev/null | grep -q "do_wp_page"; then
+    log "[方式一] perf 版本: $(perf --version 2>&1)"
+    log "[方式一] 当前用户: $(id -un) (uid=$(id -u)), " \
+        "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo '?')"
+
+    if perf probe -l 2>&1 | grep -q "do_wp_page"; then
         log "[方式一] 探针 $PROBE_NAME 已存在。"
         return 0
     fi
-    if perf probe --add do_wp_page >/dev/null 2>&1; then
+
+    log "[方式一] 执行: perf probe --add do_wp_page"
+    if perf probe --add do_wp_page 2>&1; then
         log "[方式一] 已注册探针 $PROBE_NAME。"
         return 0
     fi
-    die "注册探针失败, 请以 root 运行并确认内核支持 kprobe。"
+    die "注册探针失败(上方为 perf 原始输出)。需 root/CAP_PERFMON 且内核支持 kprobe。"
 }
 
 del_probe() {
@@ -79,7 +87,12 @@ cmd_record() {
     need_perf
     add_probe
 
-    log "[方式一] 开始记录子进程用户态调用栈: perf record --user-callchains -e $PROBE_NAME -g -p $PID"
+    if ! kill -0 "$PID" 2>/dev/null; then
+        die "目标进程 $PID 不存在或不可见, 无法 attach。"
+    fi
+
+    log "[方式一] 开始记录子进程用户态调用栈:"
+    log "         perf record --user-callchains -e $PROBE_NAME -g -p $PID -o $OUT/perf.data"
     # 前台运行; 收到 SIGINT 时 perf 会停止并写出 perf.data。
     # 用 exec 让 SIGINT 直达 perf。
     exec perf record --user-callchains -e "$PROBE_NAME" -g -p "$PID" \
