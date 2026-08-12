@@ -9,26 +9,28 @@
  *
  * 本程序提供两种方式来"观测"子进程的 COW 事件:
  *
- *   方式一 (--method 1):
+ *   方式一 (--watch method1):
  *     在 fork 出子进程后, 启动外部脚本 scripts/perf_cow_watch.sh, 该脚本用
  *       perf probe --add do_wp_page
  *       perf record -e probe:do_wp_page -g -p <子进程pid>
- *     追踪子进程的 COW 事件调用栈; 在子进程真正退出之前, 本程序停止该脚本,
+ *     仅追踪子进程的用户态调用栈; 在子进程真正退出之前, 本程序停止该脚本,
  *     再由脚本用 perf script / perf report 输出堆栈, 并按 事件数 x 页大小
  *     估算 COW 内存大小。
  *
- *   方式二 (--method 2):
+ *   方式二 (--watch method2):
  *     由本程序自身用 perf_event_open() 订阅 do_wp_page 事件(原理与
  *     perf record -e probe:do_wp_page 相同): 先经由 tracefs 注册 kprobe
  *     得到 tracepoint id, 再 perf_event_open(PERF_TYPE_TRACEPOINT) 挂到
- *     子进程上, 通过 mmap 环形缓冲区读取每次事件的调用栈(内核态 + 子进程
- *     用户态), 统计事件数并汇总 COW 内存大小, 输出为文本。
+ *     子进程上, 通过 mmap 环形缓冲区读取每次事件的子进程用户态调用栈,
+ *     统计事件数并汇总 COW 内存大小, 输出为文本。
  *
  *     若运行环境的内核未开放 kprobe/tracefs(例如受限容器), 方式二支持一个
  *     可移植回退后端 (--backend swfault): 改用 perf_event_open 订阅
  *     子进程的"软件缺页(page-fault)"事件。它复用完全相同的 perf 环形缓冲 +
  *     调用栈采集通路, 依然能采到子进程用户态调用栈并按缺页数汇总 COW 内存,
  *     只是事件源不是 do_wp_page 内核探针。该模式会明确打印告警。
+ *
+ *   未指定 --watch 时, 两种方式会针对同一个子进程同时启动。
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -62,8 +64,14 @@ enum backend {
     BK_SWFAULT,    /* 软件缺页事件(可移植回退) */
 };
 
+enum watch_mode {
+    WATCH_BOTH = 0,
+    WATCH_METHOD1,
+    WATCH_METHOD2,
+};
+
 struct config {
-    int method;            /* 1 或 2 */
+    enum watch_mode watch; /* 默认同时启动方式一和方式二 */
     size_t size_mib;       /* 申请内存大小(MiB) */
     enum backend backend;  /* 方式二后端 */
     int max_print;         /* 打印多少条样本调用栈 */
@@ -312,9 +320,7 @@ static void collector_free(struct collector *c)
     free(c->keep);
 }
 
-/* perf_event 上下文标记(用于区分内核/用户帧) */
-#define CTX_HV      ((uint64_t)-32)   /* PERF_CONTEXT_HV */
-#define CTX_KERNEL  ((uint64_t)-128)  /* PERF_CONTEXT_KERNEL */
+/* perf_event 上下文标记(这里只保留用户态调用栈) */
 #define CTX_USER    ((uint64_t)-512)  /* PERF_CONTEXT_USER */
 #define CTX_MAX     ((uint64_t)-4095) /* 约定: >= 该值视为上下文标记 */
 
@@ -337,7 +343,7 @@ static int method2_open(pid_t child, enum backend want, const char *tracefs,
         attr.sample_period = 1;
         attr.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN;
         attr.disabled = 1;
-        attr.exclude_callchain_kernel = 0;
+        attr.exclude_callchain_kernel = 1;
         attr.exclude_callchain_user = 0;
         attr.wakeup_events = 1;
 
@@ -363,7 +369,7 @@ static int method2_open(pid_t child, enum backend want, const char *tracefs,
         attr.sample_period = 1;
         attr.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN;
         attr.disabled = 1;
-        attr.exclude_callchain_kernel = 0;
+        attr.exclude_callchain_kernel = 1;
         attr.exclude_callchain_user = 0;
         attr.wakeup_events = 1;
 
@@ -379,240 +385,275 @@ static int method2_open(pid_t child, enum backend want, const char *tracefs,
     return -1;
 }
 
-static void print_stack(struct sample *s, symtab_t *ks, int have_kaddr,
-                        usym_ctx_t *us, int max_frames)
+static void print_stack(struct sample *s, usym_ctx_t *us, int max_frames)
 {
     int shown = 0;
-    int in_kernel = 0; /* 首帧默认视为内核(perf 惯例), 直到遇到 CTX_USER */
+    int in_user = 0;
     for (uint64_t i = 0; i < s->nr && shown < max_frames; i++) {
         uint64_t ip = s->ips[i];
-        if (ip == CTX_KERNEL || ip == CTX_HV) { in_kernel = 1; continue; }
-        if (ip == CTX_USER) { in_kernel = 0; continue; }
+        if (ip == CTX_USER) { in_user = 1; continue; }
         if (is_ctx_marker(ip)) continue;
+        if (!in_user) continue;
 
         unsigned long off = 0;
-        if (in_kernel) {
-            const char *nm = have_kaddr ? ksym_resolve(ks, ip, &off) : NULL;
-            if (nm)
-                printf("        #%-2d [k] %s+0x%lx\n", shown, nm, off);
-            else
-                printf("        #%-2d [k] 0x%llx\n", shown, (unsigned long long)ip);
-        } else {
-            const char *fn = NULL, *mod = NULL;
-            usym_resolve(us, ip, &fn, &off, &mod);
-            if (fn)
-                printf("        #%-2d [u] %s+0x%lx (%s)\n", shown, fn, off,
-                       mod ? mod : "?");
-            else if (mod)
-                printf("        #%-2d [u] %s+0x%lx\n", shown, mod, off);
-            else
-                printf("        #%-2d [u] 0x%llx\n", shown, (unsigned long long)ip);
-        }
+        const char *fn = NULL, *mod = NULL;
+        usym_resolve(us, ip, &fn, &off, &mod);
+        if (fn)
+            printf("        #%-2d [u] %s+0x%lx (%s)\n", shown, fn, off,
+                   mod ? mod : "?");
+        else if (mod)
+            printf("        #%-2d [u] %s+0x%lx\n", shown, mod, off);
+        else
+            printf("        #%-2d [u] 0x%llx\n", shown, (unsigned long long)ip);
         shown++;
     }
 }
 
-static int run_method2(struct config *cfg, volatile char *buf, size_t bytes,
-                       pid_t child, struct sync_pipes *sp)
-{
-    (void)buf;
-    const char *tracefs = find_tracefs();
-    int tp_id = -1;
-    int kprobe_ok = 0;
+struct method1_watch {
+    pid_t recorder;
+    char outdir[64];
+    char pages[32];
+    int active;
+    int recorded;
+};
 
-    if (cfg->backend != BK_SWFAULT) {
-        if (tracefs) {
-            tp_id = kprobe_register(tracefs, cfg->verbose);
-            if (tp_id >= 0) kprobe_ok = 1;
-        }
-        if (!kprobe_ok && cfg->backend == BK_KPROBE) {
-            fprintf(stderr,
-                    "[方式二] 无法注册 do_wp_page kprobe (tracefs=%s)。\n"
-                    "         请以 root 运行, 并确认内核支持 kprobe/tracefs, "
-                    "或改用 --backend swfault。\n",
-                    tracefs ? tracefs : "未找到");
-            /* 让子进程退出, 避免卡死 */
-            notify(sp->go[1]); waitfor(sp->wrote[0]); notify(sp->quit[1]);
-            return 1;
-        }
-    }
-
-    enum backend used = BK_SWFAULT;
-    int fd = method2_open(child, cfg->backend, tracefs, tp_id, &used, cfg->verbose);
-    if (fd < 0) {
-        fprintf(stderr, "[方式二] perf_event_open 失败, 无法采集。\n");
-        if (kprobe_ok) kprobe_unregister(tracefs);
-        notify(sp->go[1]); waitfor(sp->wrote[0]); notify(sp->quit[1]);
-        return 1;
-    }
-
-    printf("========================================================\n");
-    printf(" 方式二: perf_event_open 订阅 %s\n",
-           used == BK_KPROBE ? "do_wp_page (kprobe tracepoint)"
-                             : "软件缺页事件 (PERF_COUNT_SW_PAGE_FAULTS)");
-    if (used == BK_SWFAULT) {
-        printf(" [告警] 当前环境未启用 do_wp_page kprobe, 已回退到软件缺页后端。\n");
-        printf("        采集通路(perf 环形缓冲 + 调用栈)与 kprobe 完全一致,\n");
-        printf("        子进程逐页写入 COW 页, 故缺页数≈COW 事件数。\n");
-    }
-    printf("========================================================\n");
-
+struct method2_watch {
+    int fd;
+    int active;
+    int kprobe_ok;
+    const char *tracefs;
+    enum backend used;
     struct collector col;
-    if (collector_init(&col, fd, cfg->max_print) < 0) {
-        fprintf(stderr, "[方式二] mmap 环形缓冲失败: %s\n", strerror(errno));
-        close(fd);
-        if (kprobe_ok) kprobe_unregister(tracefs);
-        return 1;
+    usym_ctx_t *us;
+    long long counter;
+};
+
+static int method1_start(struct method1_watch *w, struct config *cfg,
+                         pid_t child, size_t bytes)
+{
+    memset(w, 0, sizeof(*w));
+    snprintf(w->outdir, sizeof(w->outdir), "/tmp/cow_demo_perfXXXXXX");
+    if (!mkdtemp(w->outdir)) {
+        perror("mkdtemp");
+        return -1;
     }
 
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+    char pidstr[32];
+    snprintf(pidstr, sizeof(pidstr), "%d", (int)child);
+    snprintf(w->pages, sizeof(w->pages), "%zu", bytes / (size_t)page_size);
 
-    notify(sp->go[1]);            /* 放行子进程开始 COW 写入 */
+    printf("========================================================\n");
+    printf(" 方式一: perf record --user-callchains -e probe:do_wp_page -g -p %d\n",
+           (int)child);
+    printf(" 记录脚本: %s\n", cfg->script);
+    printf(" 输出目录: %s\n", w->outdir);
+    printf("========================================================\n");
 
-    /*
-     * 边写边收: 在子进程写入期间持续 poll + 排空环形缓冲, 避免缓冲溢出丢样本。
-     * 同时监听 wrote 管道: 子进程写完后再做最后几次排空。
-     */
-    struct pollfd pfds[2];
-    pfds[0].fd = fd;            pfds[0].events = POLLIN;
-    pfds[1].fd = sp->wrote[0];  pfds[1].events = POLLIN;
-    usym_ctx_t *us = NULL;
-    int child_wrote = 0;
-    while (1) {
-        int pr = poll(pfds, 2, 100);
-        if (pr < 0 && errno == EINTR) continue;
-        collector_drain(&col);
-        if (!child_wrote && (pfds[1].revents & POLLIN)) {
-            waitfor(sp->wrote[0]);          /* 消费通知 */
-            child_wrote = 1;
-            /* 子进程仍存活(等待 quit), 抓取其地址空间用于用户态符号化 */
-            us = usym_capture(child);
-        }
-        if (child_wrote) {
-            /* 再多排空几轮, 确保收尾样本落袋 */
-            collector_drain(&col);
-            uint64_t head = __atomic_load_n(&col.meta->data_head, __ATOMIC_ACQUIRE);
-            if (head == col.meta->data_tail)
-                break;
-        }
+    w->recorder = fork();
+    if (w->recorder == 0) {
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", cfg->script, "record",
+              "--pid", pidstr, "--out", w->outdir, (char *)NULL);
+        _exit(127);
     }
-
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-    collector_drain(&col);
-
-    /* 读取硬件/软件计数器累计值 */
-    long long counter = 0;
-    if (read(fd, &counter, sizeof(counter)) != sizeof(counter))
-        counter = -1;
-
-    /* 内核符号表 */
-    symtab_t ks; int have_kaddr = 0;
-    ksyms_load(&ks, &have_kaddr);
-
-    /* -------- 打印样本调用栈 -------- */
-    int nprint = col.keep_n < cfg->max_print ? col.keep_n : cfg->max_print;
-    for (int i = 0; i < nprint; i++) {
-        printf("\n  [样本 #%d] 调用栈 (自顶向下):\n", i + 1);
-        print_stack(&col.keep[i], &ks, have_kaddr, us, cfg->max_frames);
+    if (w->recorder < 0) {
+        perror("fork(record)");
+        return -1;
     }
+    setpgid(w->recorder, w->recorder);
+    usleep((useconds_t)cfg->warmup_ms * 1000);
 
-    /* -------- COW 汇总 -------- */
-    unsigned long long events = col.n_samples;
-    unsigned long long cow_bytes = events * (unsigned long long)page_size;
-    printf("\n--------------------- COW 内存汇总 ---------------------\n");
-    printf("  目标子进程 PID     : %d\n", (int)child);
-    printf("  采集事件源         : %s\n",
-           used == BK_KPROBE ? "probe:do_wp_page" : "sw:page-faults(回退)");
-    printf("  申请/写入内存      : %zu MiB (%zu 页, 页大小 %ld 字节)\n",
-           cfg->size_mib, bytes / page_size, page_size);
-    printf("  采集到事件数       : %llu\n", events);
-    printf("  计数器累计值       : %lld\n", counter);
-    if (col.n_lost)
-        printf("  丢失样本(缓冲溢出) : %llu\n", col.n_lost);
-    printf("  估算 COW 内存      : %llu 字节 (%.2f MiB) = 事件数 x 页大小\n",
-           cow_bytes, cow_bytes / (1024.0 * 1024.0));
-    if (used == BK_SWFAULT && events > (unsigned long long)(bytes / page_size))
-        printf("  (注: 事件数略多于写入页数, 因回退后端统计的是全部缺页,\n"
-               "       含子进程首次执行 libc 等代码路径产生的零星缺页)\n");
-    printf("--------------------------------------------------------\n");
-
-    symtab_free(&ks);
-    usym_free(us);
-    collector_free(&col);
-    close(fd);
-    if (kprobe_ok) kprobe_unregister(tracefs);
-
-    /* 放行子进程退出 */
-    notify(sp->quit[1]);
+    int st = 0;
+    if (waitpid(w->recorder, &st, WNOHANG) == w->recorder) {
+        fprintf(stderr, "[方式一] 记录脚本启动失败。\n");
+        return -1;
+    }
+    w->active = 1;
     return 0;
 }
 
-/* ------------------------------ 方式一实现 ------------------------------ */
-
-static int run_method1(struct config *cfg, volatile char *buf, size_t bytes,
-                       pid_t child, struct sync_pipes *sp)
+static void method1_stop(struct method1_watch *w)
 {
-    (void)buf;
-    char outdir[] = "/tmp/cow_demo_perfXXXXXX";
-    if (!mkdtemp(outdir)) {
-        perror("mkdtemp");
-        notify(sp->go[1]); waitfor(sp->wrote[0]); notify(sp->quit[1]);
-        return 1;
-    }
+    if (!w->active) return;
+    kill(-w->recorder, SIGINT);
+    int st = 0;
+    waitpid(w->recorder, &st, 0);
+    w->active = 0;
+    w->recorded = 1;
+}
 
-    char pidstr[32], sizestr[32];
-    snprintf(pidstr, sizeof(pidstr), "%d", (int)child);
-    snprintf(sizestr, sizeof(sizestr), "%zu", bytes / (size_t)page_size);
-
-    printf("========================================================\n");
-    printf(" 方式一: perf record -e probe:do_wp_page -g -p %d\n", (int)child);
-    printf(" 记录脚本: %s\n", cfg->script);
-    printf(" 输出目录: %s\n", outdir);
-    printf("========================================================\n");
-
-    /* 启动记录: 子进程组内 exec 脚本的 record 模式(前台运行 perf record) */
-    pid_t rec = fork();
-    if (rec == 0) {
-        setpgid(0, 0); /* 独立进程组, 便于定向发送 SIGINT */
-        execl("/bin/sh", "sh", cfg->script, "record",
-              "--pid", pidstr, "--out", outdir, (char *)NULL);
-        _exit(127);
-    }
-    if (rec < 0) {
-        perror("fork(record)");
-        notify(sp->go[1]); waitfor(sp->wrote[0]); notify(sp->quit[1]);
-        return 1;
-    }
-    setpgid(rec, rec); /* 与子分支竞争消除 */
-
-    /* 等待 perf 完成 attach 的热身时间 */
-    usleep((useconds_t)cfg->warmup_ms * 1000);
-
-    /* 放行子进程执行 COW 写入 */
-    notify(sp->go[1]);
-    waitfor(sp->wrote[0]); /* 子进程写完(仍存活) */
-
-    /* 在子进程退出前停止记录: 向记录进程组发送 SIGINT, perf 收尾写出 perf.data */
-    kill(-rec, SIGINT);
-    int rst = 0;
-    waitpid(rec, &rst, 0);
-
-    /* 允许子进程退出(记录已停止) */
-    notify(sp->quit[1]);
-
-    /* 分析: 运行脚本 report 模式, 输出堆栈与 COW 汇总 */
+static void method1_report(struct method1_watch *w, struct config *cfg)
+{
+    if (!w->recorded) return;
     pid_t rep = fork();
     if (rep == 0) {
         execl("/bin/sh", "sh", cfg->script, "report",
-              "--out", outdir, "--pages", sizestr, (char *)NULL);
+              "--out", w->outdir, "--pages", w->pages, (char *)NULL);
         _exit(127);
     }
     if (rep > 0) {
         int st = 0;
         waitpid(rep, &st, 0);
     }
+}
+
+static int method2_start(struct method2_watch *w, struct config *cfg, pid_t child)
+{
+    memset(w, 0, sizeof(*w));
+    w->fd = -1;
+    w->tracefs = find_tracefs();
+    int tp_id = -1;
+
+    if (cfg->backend != BK_SWFAULT && w->tracefs) {
+        tp_id = kprobe_register(w->tracefs, cfg->verbose);
+        if (tp_id >= 0) w->kprobe_ok = 1;
+    }
+    if (!w->kprobe_ok && cfg->backend == BK_KPROBE) {
+        fprintf(stderr,
+                "[方式二] 无法注册 do_wp_page kprobe (tracefs=%s)。\n"
+                "         请检查 tracefs ACL 与 perf_event_paranoid, "
+                "或改用 --backend swfault。\n",
+                w->tracefs ? w->tracefs : "未找到");
+        return -1;
+    }
+
+    w->fd = method2_open(child, cfg->backend, w->tracefs, tp_id,
+                         &w->used, cfg->verbose);
+    if (w->fd < 0) {
+        fprintf(stderr, "[方式二] perf_event_open 失败, 无法采集。\n");
+        if (w->kprobe_ok) kprobe_unregister(w->tracefs);
+        return -1;
+    }
+    if (collector_init(&w->col, w->fd, cfg->max_print) < 0) {
+        fprintf(stderr, "[方式二] mmap 环形缓冲失败: %s\n", strerror(errno));
+        close(w->fd);
+        w->fd = -1;
+        if (w->kprobe_ok) {
+            kprobe_unregister(w->tracefs);
+            w->kprobe_ok = 0;
+        }
+        return -1;
+    }
+
+    printf("========================================================\n");
+    printf(" 方式二: perf_event_open 订阅 %s (仅用户态调用栈)\n",
+           w->used == BK_KPROBE ? "do_wp_page (kprobe tracepoint)"
+                                : "软件缺页事件 (PERF_COUNT_SW_PAGE_FAULTS)");
+    if (w->used == BK_SWFAULT) {
+        printf(" [告警] 当前环境未启用 do_wp_page kprobe, 已回退到软件缺页后端。\n");
+        printf("        子进程逐页写入 COW 页, 故缺页数≈COW 事件数。\n");
+    }
+    printf("========================================================\n");
+
+    ioctl(w->fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(w->fd, PERF_EVENT_IOC_ENABLE, 0);
+    w->active = 1;
     return 0;
+}
+
+static void wait_for_child_write(struct method2_watch *w, int wrote_fd,
+                                 pid_t child)
+{
+    if (!w->active) {
+        waitfor(wrote_fd);
+        return;
+    }
+
+    struct pollfd pfds[2] = {
+        { .fd = w->fd, .events = POLLIN },
+        { .fd = wrote_fd, .events = POLLIN },
+    };
+    for (;;) {
+        int pr = poll(pfds, 2, 100);
+        if (pr < 0 && errno == EINTR) continue;
+        collector_drain(&w->col);
+        if (pfds[1].revents & POLLIN) {
+            waitfor(wrote_fd);
+            w->us = usym_capture(child);
+            collector_drain(&w->col);
+            break;
+        }
+    }
+}
+
+static void method2_stop(struct method2_watch *w)
+{
+    if (!w->active) return;
+    ioctl(w->fd, PERF_EVENT_IOC_DISABLE, 0);
+    collector_drain(&w->col);
+    if (read(w->fd, &w->counter, sizeof(w->counter)) != sizeof(w->counter))
+        w->counter = -1;
+    w->active = 0;
+}
+
+static void method2_report(struct method2_watch *w, struct config *cfg,
+                           pid_t child, size_t bytes)
+{
+    if (w->fd < 0) return;
+    int nprint = w->col.keep_n < cfg->max_print ? w->col.keep_n : cfg->max_print;
+    for (int i = 0; i < nprint; i++) {
+        printf("\n  [方式二样本 #%d] 子进程用户态调用栈:\n", i + 1);
+        print_stack(&w->col.keep[i], w->us, cfg->max_frames);
+    }
+
+    unsigned long long events = w->col.n_samples;
+    unsigned long long cow_bytes = events * (unsigned long long)page_size;
+    printf("\n---------------- 方式二 COW 内存汇总 ----------------\n");
+    printf("  目标子进程 PID     : %d\n", (int)child);
+    printf("  采集事件源         : %s\n",
+           w->used == BK_KPROBE ? "probe:do_wp_page" : "sw:page-faults(回退)");
+    printf("  申请/写入内存      : %zu MiB (%zu 页, 页大小 %ld 字节)\n",
+           cfg->size_mib, bytes / page_size, page_size);
+    printf("  采集到事件数       : %llu\n", events);
+    printf("  计数器累计值       : %lld\n", w->counter);
+    if (w->col.n_lost)
+        printf("  丢失样本(缓冲溢出) : %llu\n", w->col.n_lost);
+    printf("  估算 COW 内存      : %llu 字节 (%.2f MiB) = 事件数 x 页大小\n",
+           cow_bytes, cow_bytes / (1024.0 * 1024.0));
+    if (w->used == BK_SWFAULT && events > (unsigned long long)(bytes / page_size))
+        printf("  (注: 回退后端包含子进程执行路径产生的零星非 COW 缺页)\n");
+    printf("------------------------------------------------------\n");
+}
+
+static void method2_cleanup(struct method2_watch *w)
+{
+    if (w->fd < 0) return;
+    usym_free(w->us);
+    collector_free(&w->col);
+    close(w->fd);
+    if (w->kprobe_ok) kprobe_unregister(w->tracefs);
+}
+
+static int run_watchers(struct config *cfg, size_t bytes, pid_t child,
+                        struct sync_pipes *sp)
+{
+    int want1 = cfg->watch == WATCH_BOTH || cfg->watch == WATCH_METHOD1;
+    int want2 = cfg->watch == WATCH_BOTH || cfg->watch == WATCH_METHOD2;
+    struct method1_watch m1;
+    struct method2_watch m2;
+    memset(&m1, 0, sizeof(m1));
+    memset(&m2, 0, sizeof(m2));
+    m2.fd = -1;
+
+    int failures = 0;
+    if (want1 && method1_start(&m1, cfg, child, bytes) < 0) failures++;
+    if (want2 && method2_start(&m2, cfg, child) < 0) failures++;
+
+    printf("[父进程] watcher 就绪: 方式一=%s, 方式二=%s; 放行子进程。\n",
+           m1.active ? "已启动" : (want1 ? "失败" : "未选择"),
+           m2.active ? "已启动" : (want2 ? "失败" : "未选择"));
+    notify(sp->go[1]);
+    wait_for_child_write(&m2, sp->wrote[0], child);
+
+    /* 两个 watcher 都必须在子进程退出之前停止。 */
+    method2_stop(&m2);
+    method1_stop(&m1);
+    notify(sp->quit[1]);
+
+    method2_report(&m2, cfg, child, bytes);
+    method1_report(&m1, cfg);
+    method2_cleanup(&m2);
+    return failures ? 1 : 0;
 }
 
 /* ------------------------------ 主程序 ------------------------------ */
@@ -621,7 +662,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "用法: %s [选项]\n"
-        "  --method N       观测方式: 1=perf record 脚本, 2=perf_event_open (默认 2)\n"
+        "  --watch W        watcher: method1|method2|both (默认 both)\n"
         "  --size M         申请内存大小, 单位 MiB (默认 16)\n"
         "  --backend B      方式二后端: auto|kprobe|swfault (默认 auto)\n"
         "  --script PATH    方式一脚本路径 (默认 scripts/perf_cow_watch.sh)\n"
@@ -638,7 +679,7 @@ int main(int argc, char **argv)
     page_size = sysconf(_SC_PAGESIZE);
 
     struct config cfg = {
-        .method = 2,
+        .watch = WATCH_BOTH,
         .size_mib = 16,
         .backend = BK_AUTO,
         .max_print = 3,
@@ -649,7 +690,7 @@ int main(int argc, char **argv)
     };
 
     static struct option opts[] = {
-        {"method", required_argument, 0, 'm'},
+        {"watch", required_argument, 0, 'W'},
         {"size", required_argument, 0, 's'},
         {"backend", required_argument, 0, 'b'},
         {"script", required_argument, 0, 'c'},
@@ -662,9 +703,17 @@ int main(int argc, char **argv)
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "m:s:b:c:w:p:f:vh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "W:s:b:c:w:p:f:vh", opts, NULL)) != -1) {
         switch (c) {
-        case 'm': cfg.method = atoi(optarg); break;
+        case 'W':
+            if (!strcmp(optarg, "both")) cfg.watch = WATCH_BOTH;
+            else if (!strcmp(optarg, "method1")) cfg.watch = WATCH_METHOD1;
+            else if (!strcmp(optarg, "method2")) cfg.watch = WATCH_METHOD2;
+            else {
+                fprintf(stderr, "--watch 只能为 method1、method2 或 both\n");
+                return 2;
+            }
+            break;
         case 's': cfg.size_mib = strtoul(optarg, NULL, 10); break;
         case 'b':
             if (!strcmp(optarg, "auto")) cfg.backend = BK_AUTO;
@@ -682,10 +731,6 @@ int main(int argc, char **argv)
         }
     }
 
-    if (cfg.method != 1 && cfg.method != 2) {
-        fprintf(stderr, "--method 只能为 1 或 2\n");
-        return 2;
-    }
     if (cfg.size_mib == 0) cfg.size_mib = 1;
 
     size_t bytes = cfg.size_mib * (size_t)1024 * 1024;
@@ -723,11 +768,7 @@ int main(int argc, char **argv)
         _exit(0); /* 不会到达 */
     }
 
-    int rc;
-    if (cfg.method == 2)
-        rc = run_method2(&cfg, buf, bytes, child, &sp);
-    else
-        rc = run_method1(&cfg, buf, bytes, child, &sp);
+    int rc = run_watchers(&cfg, bytes, child, &sp);
 
     int st = 0;
     waitpid(child, &st, 0);

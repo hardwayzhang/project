@@ -1,195 +1,186 @@
 #!/bin/sh
-# ============================================================================
-# setup.sh - 运行环境检测 (方式一/方式二 的权限与内核能力)
-# ============================================================================
+# COW watcher 运行环境与非 root 最小权限检测
 #
-#   ./setup.sh          仅检测并给出 PASS/WARN/FAIL 报告
-#   ./setup.sh --fix    在检测的同时尝试用 sudo 修复(放宽 sysctl / 挂载 tracefs /
-#                       安装 perf)
+# ./setup.sh          只检测
+# ./setup.sh --fix    尝试安装 perf、挂载 tracefs，并把 perf_event_paranoid 调为 -1
 #
-# 检测项:
-#   - 是否 root / 是否有 sudo
-#   - perf_event_paranoid / kptr_restrict
-#   - perf 是否安装 (方式一 需要)
-#   - tracefs 是否可用, kprobe_events 是否可写 (方式二 kprobe 后端 需要)
-#   - do_wp_page 是否在 /proc/kallsyms, 是否可被探测
-#   - 软件缺页后端 (方式二 回退) 是否可用
-# ============================================================================
+# 不读取或解析内核地址/内核调用栈，因此不要求 kptr_restrict=0。
+
+set -u
 
 FIX=0
 [ "${1:-}" = "--fix" ] && FIX=1
 
 GREEN=$(printf '\033[32m'); RED=$(printf '\033[31m')
 YELLOW=$(printf '\033[33m'); BOLD=$(printf '\033[1m'); RST=$(printf '\033[0m')
-
 pass() { printf '  %s[PASS]%s %s\n' "$GREEN" "$RST" "$1"; }
 warn() { printf '  %s[WARN]%s %s\n' "$YELLOW" "$RST" "$1"; }
 fail() { printf '  %s[FAIL]%s %s\n' "$RED" "$RST" "$1"; }
-head2(){ printf '\n%s== %s ==%s\n' "$BOLD" "$1" "$RST"; }
+section() { printf '\n%s== %s ==%s\n' "$BOLD" "$1" "$RST"; }
 
 IS_ROOT=0
 [ "$(id -u)" -eq 0 ] && IS_ROOT=1
 SUDO=""
-if [ "$IS_ROOT" -eq 0 ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+if [ "$IS_ROOT" -eq 0 ] && command -v sudo >/dev/null 2>&1 &&
+   sudo -n true 2>/dev/null; then
     SUDO="sudo -n"
 fi
-# 能否以特权执行(用于 --fix)
-PRIV=""
-[ "$IS_ROOT" -eq 1 ] && PRIV="sh -c"
-[ -n "$SUDO" ] && PRIV="$SUDO sh -c"
 
-run_priv() {  # run_priv "<shell command>"
-    [ -n "$PRIV" ] || { warn "无特权, 跳过: $1"; return 1; }
-    $PRIV "$1"
+run_root() {
+    if [ "$IS_ROOT" -eq 1 ]; then
+        sh -c "$1"
+    elif [ -n "$SUDO" ]; then
+        $SUDO sh -c "$1"
+    else
+        return 1
+    fi
 }
 
-METHOD1_OK=1
-METHOD2_KP_OK=1
-METHOD2_SW_OK=1
+find_tracefs() {
+    awk '$3=="tracefs"{print $2; exit}' /proc/mounts 2>/dev/null
+    for d in /sys/kernel/tracing /sys/kernel/debug/tracing; do
+        [ -e "$d/kprobe_events" ] && { echo "$d"; return; }
+        $SUDO test -e "$d/kprobe_events" 2>/dev/null &&
+            { echo "$d"; return; }
+    done
+}
 
-# ---------------------------------------------------------------- 基本信息
-head2 "基本信息"
+section "基本信息"
 echo "  内核版本 : $(uname -r)"
-echo "  架构     : $(uname -m)"
+echo "  当前用户 : $(id -un) (uid=$(id -u))"
 echo "  页大小   : $(getconf PAGESIZE) 字节"
 if [ "$IS_ROOT" -eq 1 ]; then
-    pass "以 root 运行"
+    pass "当前为 root"
 elif [ -n "$SUDO" ]; then
-    pass "非 root, 但可免密 sudo"
+    pass "当前为非 root，可免密 sudo（仅 --fix 使用）"
 else
-    warn "非 root 且无免密 sudo, 部分能力可能受限"
+    warn "当前为非 root，且无免密 sudo"
 fi
 
-# ---------------------------------------------------------------- sysctl
-head2 "perf 相关 sysctl"
 if [ "$FIX" -eq 1 ]; then
-    run_priv "echo -1 > /proc/sys/kernel/perf_event_paranoid" >/dev/null 2>&1
-    run_priv "echo 0  > /proc/sys/kernel/kptr_restrict" >/dev/null 2>&1
+    run_root "echo -1 > /proc/sys/kernel/perf_event_paranoid" 2>/dev/null || true
 fi
 PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "?")
-KPTR=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo "?")
-echo "  perf_event_paranoid = $PARANOID (<=0 才能观测其它进程; <=1 才能采集内核调用栈)"
-echo "  kptr_restrict       = $KPTR (0 才能解析内核符号地址)"
 
-if [ "$PARANOID" = "?" ]; then
-    warn "无法读取 perf_event_paranoid"
-elif [ "$IS_ROOT" -eq 1 ] || [ "$PARANOID" -le 1 ] 2>/dev/null; then
-    pass "perf_event_paranoid 满足内核栈采集 (=$PARANOID)"
+section "非 root 最小权限（请明确区分两种方式）"
+cat <<EOF
+  共同前提:
+    1. watcher 与目标子进程同一 uid（本 demo 天然满足）；
+    2. tracefs 已挂载；
+    3. 非 root 可写 <tracefs>/kprobe_events，并可遍历/读取
+       <tracefs>/events/kprobes/.../id（建议管理员用 ACL 只授权该用户）；
+    4. 以下二选一:
+       A. kernel.perf_event_paranoid = -1；或
+       B. 相关可执行文件具有 CAP_PERFMON（仍需上面的 tracefs ACL）。
+
+  方式一 (--watch method1):
+    - 需要 perf；
+    - 若选能力方案 B，应给 perf CAP_PERFMON；
+    - 需要 perf probe 对 kprobe_events 的写权限。
+
+  方式二 (--watch method2, kprobe 后端):
+    - 不需要 perf 命令；
+    - 若选能力方案 B，应给 cow_demo CAP_PERFMON；
+    - 需要 cow_demo 对 kprobe_events 的写权限和事件 id 的读权限。
+
+  方式二 swfault 回退:
+    - 不需要 tracefs/kprobe；
+    - 仅采用户态调用栈，同 uid 子进程通常在 perf_event_paranoid <= 2 时可用。
+
+  本项目不采集内核调用栈、不解析内核地址，因此无需调整 kptr_restrict。
+EOF
+
+section "perf_event 权限"
+echo "  perf_event_paranoid = $PARANOID"
+if [ "$IS_ROOT" -eq 1 ]; then
+    pass "root 可绕过 perf_event_paranoid"
+elif [ "$PARANOID" = "-1" ]; then
+    pass "方式一和方式二 kprobe 后端满足 perf_event 最小 sysctl 条件"
 else
-    warn "perf_event_paranoid=$PARANOID 偏严, 建议以 root 运行或 ./setup.sh --fix"
-fi
-if [ "$KPTR" = "0" ] || [ "$IS_ROOT" -eq 1 ]; then
-    pass "可解析内核符号地址 (kptr_restrict=$KPTR)"
-else
-    warn "kptr_restrict=$KPTR, 内核帧可能显示为地址, 建议 --fix"
+    warn "kprobe watcher 的非 root 最小值是 -1；也可用 CAP_PERFMON 代替"
 fi
 
-# ---------------------------------------------------------------- do_wp_page 符号
-head2 "do_wp_page 内核符号"
-if grep -qw do_wp_page /proc/kallsyms 2>/dev/null; then
-    ADDR=$( ( $SUDO cat /proc/kallsyms 2>/dev/null || cat /proc/kallsyms ) | \
-            awk '$3=="do_wp_page"{print $1; exit}')
-    pass "在 /proc/kallsyms 中找到 do_wp_page (addr=$ADDR)"
-else
-    fail "未找到 do_wp_page 符号 (该内核可能无法探测)"
-    METHOD1_OK=0; METHOD2_KP_OK=0
-fi
-
-# ---------------------------------------------------------------- perf (方式一)
-head2 "perf 工具 (方式一 需要)"
+section "perf 工具（仅方式一需要）"
+METHOD1_OK=1
 if command -v perf >/dev/null 2>&1; then
     pass "perf 已安装: $(perf --version 2>/dev/null)"
 else
-    fail "未安装 perf"
     METHOD1_OK=0
+    fail "未安装 perf"
+    echo "  安装建议: sudo apt-get install linux-tools-\$(uname -r) linux-tools-generic"
     if [ "$FIX" -eq 1 ]; then
         echo "  尝试安装 perf ..."
-        run_priv "apt-get update -y >/dev/null 2>&1 && \
-                  apt-get install -y linux-tools-common linux-tools-generic \
-                  linux-tools-\$(uname -r) >/dev/null 2>&1" && \
-            command -v perf >/dev/null 2>&1 && { pass "perf 安装成功"; METHOD1_OK=1; } || \
-            warn "自动安装 perf 失败, 请手动安装匹配当前内核的 linux-tools"
-    else
-        echo "  安装建议: sudo apt-get install linux-tools-\$(uname -r) linux-tools-generic"
+        run_root "apt-get update -y >/dev/null 2>&1 &&
+                  apt-get install -y linux-tools-common linux-tools-generic linux-tools-\$(uname -r) >/dev/null 2>&1" || true
+        if command -v perf >/dev/null 2>&1; then
+            pass "perf 安装成功"
+            METHOD1_OK=1
+        fi
     fi
 fi
 
-# ---------------------------------------------------------------- tracefs / kprobe (方式二 kprobe)
-head2 "tracefs / kprobe (方式二 kprobe 后端 需要)"
-find_tracefs() {
-    # 已挂载的 tracefs
-    awk '$3=="tracefs"{print $2; exit}' /proc/mounts 2>/dev/null && return 0
-    for d in /sys/kernel/tracing /sys/kernel/debug/tracing; do
-        if $SUDO test -e "$d/kprobe_events" 2>/dev/null || [ -e "$d/kprobe_events" ]; then
-            echo "$d"; return 0
-        fi
-    done
-    return 1
-}
-TRACEFS=$(find_tracefs)
-
+TRACEFS=$(find_tracefs | sed -n '1p')
 if [ -z "$TRACEFS" ] && [ "$FIX" -eq 1 ]; then
-    echo "  未发现 tracefs, 尝试挂载 ..."
-    run_priv "mkdir -p /sys/kernel/tracing && mount -t tracefs nodev /sys/kernel/tracing" 2>/dev/null
-    run_priv "mount -t tracefs nodev /sys/kernel/debug/tracing" 2>/dev/null
-    TRACEFS=$(find_tracefs)
+    run_root "mkdir -p /sys/kernel/tracing &&
+              mount -t tracefs nodev /sys/kernel/tracing" 2>/dev/null || true
+    TRACEFS=$(find_tracefs | sed -n '1p')
 fi
 
-if [ -n "$TRACEFS" ]; then
-    pass "tracefs 可用: $TRACEFS"
+section "tracefs / do_wp_page kprobe（两种 kprobe watcher 共用）"
+KPROBE_OK=0
+if [ -z "$TRACEFS" ]; then
+    fail "未找到 tracefs；方式一和方式二 kprobe 后端不可用"
+else
+    pass "tracefs: $TRACEFS"
     KPE="$TRACEFS/kprobe_events"
-    if [ -w "$KPE" ] || [ "$IS_ROOT" -eq 1 ] || [ -n "$SUDO" ]; then
-        # 实测: 注册并删除一个临时 do_wp_page 探针
-        if run_priv "echo 'p:cowdemo_probe do_wp_page' > $KPE" 2>/dev/null; then
-            if $SUDO test -e "$TRACEFS/events/kprobes/cowdemo_probe/id" 2>/dev/null; then
-                pass "成功注册 do_wp_page kprobe (实测通过)"
-            else
-                warn "写入 kprobe_events 成功但未见事件 id"
-            fi
-            run_priv "echo '-:cowdemo_probe' > $KPE" 2>/dev/null
-        else
-            fail "无法写入 $KPE 注册 kprobe"
-            METHOD2_KP_OK=0
-        fi
+    if [ -w "$KPE" ]; then
+        pass "当前非 root 用户可写 $KPE"
+    elif [ "$IS_ROOT" -eq 1 ]; then
+        pass "root 可写 $KPE"
     else
-        fail "$KPE 不可写 (需 root)"
-        METHOD2_KP_OK=0
+        fail "当前非 root 用户不可写 $KPE"
+        echo "  最小授权示例（由管理员执行，按实际 tracefs 路径调整）:"
+        echo "    sudo setfacl -m u:$(id -un):rx $TRACEFS $TRACEFS/events"
+        echo "    sudo setfacl -m u:$(id -un):rw $KPE"
     fi
-else
-    fail "未找到 tracefs (内核可能未启用 kprobe/ftrace)"
-    METHOD2_KP_OK=0
-    echo "  说明: 方式二可用 --backend swfault 回退(不依赖 tracefs)。"
+
+    # 直接实测按名字注册探针，不读取 /proc/kallsyms，也不解析内核地址。
+    if [ -w "$KPE" ]; then
+        if printf '%s\n' 'p:cowdemo_setup_check do_wp_page' >> "$KPE" 2>/dev/null; then
+            pass "do_wp_page kprobe 注册实测通过（未解析内核符号地址）"
+            printf '%s\n' '-:cowdemo_setup_check' >> "$KPE" 2>/dev/null || true
+            KPROBE_OK=1
+        else
+            fail "do_wp_page kprobe 注册失败"
+        fi
+    elif [ "$IS_ROOT" -eq 1 ] || [ -n "$SUDO" ]; then
+        if run_root "echo 'p:cowdemo_setup_check do_wp_page' >> '$KPE'" 2>/dev/null; then
+            pass "do_wp_page kprobe 注册实测通过（未解析内核符号地址）"
+            run_root "echo '-:cowdemo_setup_check' >> '$KPE'" 2>/dev/null || true
+            KPROBE_OK=1
+        else
+            fail "do_wp_page kprobe 注册失败"
+        fi
+    fi
 fi
 
-# ---------------------------------------------------------------- 软件缺页后端 (方式二回退)
-head2 "软件缺页后端 (方式二 回退, 无需 tracefs)"
-# 软件事件对本进程通常允许(paranoid<=2)
-if [ "$PARANOID" = "?" ]; then
-    warn "无法判断, 但通常可用"
-elif [ "$IS_ROOT" -eq 1 ] || [ "$PARANOID" -le 2 ] 2>/dev/null; then
-    pass "可使用 PERF_COUNT_SW_PAGE_FAULTS (paranoid=$PARANOID)"
+section "结论"
+if [ "$METHOD1_OK" -eq 1 ] && [ "$KPROBE_OK" -eq 1 ]; then
+    pass "方式一依赖满足（仍需满足上面的 perf_event 非 root 条件）"
 else
-    warn "paranoid=$PARANOID 可能限制采集"
-    METHOD2_SW_OK=0
+    warn "方式一依赖不完整"
 fi
-
-# ---------------------------------------------------------------- 汇总
-head2 "结论"
-if [ "$METHOD1_OK" -eq 1 ]; then
-    pass "方式一 (perf record -e probe:do_wp_page) 预期可用"
+if [ "$KPROBE_OK" -eq 1 ]; then
+    pass "方式二 kprobe 后端依赖满足（仍需满足 perf_event 条件）"
 else
-    fail "方式一 不满足 (缺 perf 或 kprobe/符号)"
+    warn "方式二 kprobe 后端不可用；可选 --backend swfault"
 fi
-if [ "$METHOD2_KP_OK" -eq 1 ]; then
-    pass "方式二 kprobe 后端 (perf_event_open + do_wp_page) 预期可用"
+if [ "$IS_ROOT" -eq 1 ] || [ "$PARANOID" != "?" ] &&
+   [ "$PARANOID" -le 2 ] 2>/dev/null; then
+    pass "方式二 swfault 回退预期可用"
 else
-    warn "方式二 kprobe 后端 不满足, 请改用 --backend swfault"
-fi
-if [ "$METHOD2_SW_OK" -eq 1 ]; then
-    pass "方式二 swfault 回退后端 预期可用"
-else
-    warn "方式二 swfault 回退后端 可能受限"
+    warn "方式二 swfault 回退可能受 perf_event_paranoid 限制"
 fi
 
 echo ""
-echo "提示: 若权限不足, 可尝试:  ./setup.sh --fix   或以 root 运行 demo。"
+echo "提示: --fix 只处理系统级依赖/sysctl；tracefs 的非 root ACL 应由管理员审慎配置。"

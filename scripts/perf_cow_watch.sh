@@ -3,11 +3,11 @@
 # perf_cow_watch.sh - 方式一: 用 perf record 追踪子进程的 do_wp_page(COW) 事件
 # ============================================================================
 #
-# 由 cow_demo (--method 1) 调用, 分两个子命令:
+# 由 cow_demo (--watch method1/both) 调用, 分两个子命令:
 #
 #   record --pid <PID> --out <DIR>
 #       注册 do_wp_page 探针(perf probe --add), 然后前台运行
-#         perf record -e probe:do_wp_page -g -p <PID> -o <DIR>/perf.data
+#         perf record --user-callchains -e probe:do_wp_page -g -p <PID>
 #       调用方(cow_demo)在子进程写完 COW、退出之前, 向本进程发送 SIGINT,
 #       perf 收尾并写出 perf.data。
 #
@@ -79,10 +79,11 @@ cmd_record() {
     need_perf
     add_probe
 
-    log "[方式一] 开始记录: perf record -e $PROBE_NAME -g -p $PID -o $OUT/perf.data"
+    log "[方式一] 开始记录子进程用户态调用栈: perf record --user-callchains -e $PROBE_NAME -g -p $PID"
     # 前台运行; 收到 SIGINT 时 perf 会停止并写出 perf.data。
     # 用 exec 让 SIGINT 直达 perf。
-    exec perf record -e "$PROBE_NAME" -g -p "$PID" -o "$OUT/perf.data"
+    exec perf record --user-callchains -e "$PROBE_NAME" -g -p "$PID" \
+        -o "$OUT/perf.data"
 }
 
 cmd_report() {
@@ -101,8 +102,8 @@ cmd_report() {
 
     need_perf
 
-    echo "----------------------- 调用栈 (perf script) -----------------------"
-    # 输出前若干条样本的完整调用栈(内核态 + 子进程用户态)
+    echo "---------------- 子进程用户态调用栈 (perf script) ----------------"
+    # 记录阶段使用 --user-callchains, perf.data 中不包含内核调用链。
     perf script -i "$DATA" 2>/dev/null > "$OUT/script.txt" || true
     if [ -s "$OUT/script.txt" ]; then
         # 打印前 3 个样本块(以空行分隔)
@@ -112,10 +113,6 @@ cmd_report() {
     else
         log "[方式一] perf script 无输出(可能未采集到事件)。"
     fi
-
-    echo ""
-    echo "----------------------- 聚合报告 (perf report) ---------------------"
-    perf report -i "$DATA" --stdio -g --percent-limit 1 2>/dev/null | head -n 40 || true
 
     # 统计事件数: perf script 中每个样本含一行事件名 probe:do_wp_page
     EVENTS=$(grep -c "probe:do_wp_page" "$OUT/script.txt" 2>/dev/null || echo 0)

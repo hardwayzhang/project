@@ -13,85 +13,13 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-/* ============================ 内核符号 ============================ */
+/* ============================ 通用符号表辅助 ============================ */
 
 static int sym_cmp(const void *a, const void *b)
 {
     const sym_t *x = a, *y = b;
     if (x->addr < y->addr) return -1;
     if (x->addr > y->addr) return 1;
-    return 0;
-}
-
-int ksyms_load(symtab_t *tab, int *have_addr)
-{
-    memset(tab, 0, sizeof(*tab));
-    if (have_addr) *have_addr = 0;
-
-    FILE *fp = fopen("/proc/kallsyms", "r");
-    if (!fp)
-        return -1;
-
-    size_t cap = 4096, n = 0;
-    sym_t *arr = malloc(cap * sizeof(*arr));
-    /* 名字池：先累计到动态缓冲 */
-    size_t spcap = 1 << 20, splen = 0;
-    char *sp = malloc(spcap);
-    if (!arr || !sp) {
-        free(arr); free(sp); fclose(fp);
-        return -1;
-    }
-
-    char line[512];
-    int any_nonzero = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        unsigned long addr;
-        char type, name[256];
-        /* 格式: <addr> <type> <name> [module] */
-        if (sscanf(line, "%lx %c %255s", &addr, &type, name) != 3)
-            continue;
-        /* 只关心代码符号：t/T (text)、w/W (weak) */
-        if (type != 't' && type != 'T' && type != 'w' && type != 'W')
-            continue;
-        if (addr != 0)
-            any_nonzero = 1;
-
-        size_t nl = strlen(name) + 1;
-        if (splen + nl > spcap) {
-            spcap *= 2;
-            char *nsp = realloc(sp, spcap);
-            if (!nsp) break;
-            sp = nsp;
-        }
-        if (n == cap) {
-            cap *= 2;
-            sym_t *na = realloc(arr, cap * sizeof(*arr));
-            if (!na) break;
-            arr = na;
-        }
-        memcpy(sp + splen, name, nl);
-        /* 先存偏移，稍后统一转成指针（realloc 可能移动 sp） */
-        arr[n].name = (char *)(uintptr_t)splen;
-        arr[n].addr = addr;
-        arr[n].size = 0;
-        n++;
-        splen += nl;
-    }
-    fclose(fp);
-
-    /* 将 name 从偏移修正为真实指针 */
-    for (size_t i = 0; i < n; i++)
-        arr[i].name = sp + (uintptr_t)arr[i].name;
-
-    qsort(arr, n, sizeof(*arr), sym_cmp);
-    /* 用后一个符号地址推算每个符号大小 */
-    for (size_t i = 0; i + 1 < n; i++)
-        arr[i].size = arr[i + 1].addr - arr[i].addr;
-
-    tab->syms = arr;
-    tab->n = n;
-    tab->strpool = sp;
-    if (have_addr) *have_addr = any_nonzero;
     return 0;
 }
 
@@ -112,11 +40,6 @@ static const char *tab_resolve(const symtab_t *tab, unsigned long ip, unsigned l
         return NULL; /* 落在两个符号之间的空洞 */
     if (off) *off = ip - s->addr;
     return s->name;
-}
-
-const char *ksym_resolve(const symtab_t *tab, unsigned long ip, unsigned long *off)
-{
-    return tab_resolve(tab, ip, off);
 }
 
 void symtab_free(symtab_t *tab)

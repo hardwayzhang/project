@@ -1,9 +1,8 @@
 /*
- * symbolize.h - 内核态与用户态地址符号化辅助
+ * symbolize.h - 用户态地址符号化辅助
  *
  * 用于把 perf 采集到的调用栈地址（指令指针）翻译成可读的
  * "函数名+偏移" 形式：
- *   - 内核帧：解析 /proc/kallsyms
  *   - 用户帧：解析目标进程 /proc/<pid>/maps + 对应 ELF 文件的符号表
  */
 #ifndef COW_SYMBOLIZE_H
@@ -25,16 +24,6 @@ typedef struct {
     size_t n;
     char *strpool; /* 名字使用的字符串池，统一释放 */
 } symtab_t;
-
-/* ---------------- 内核符号 ---------------- */
-
-/* 从 /proc/kallsyms 加载内核符号。成功返回 0。
- * 若 kptr_restrict 使地址全为 0，则 have_addr 置 0。*/
-int ksyms_load(symtab_t *tab, int *have_addr);
-
-/* 解析内核地址，返回函数名（内部指针，勿释放），*off 为偏移。
- * 找不到返回 NULL。*/
-const char *ksym_resolve(const symtab_t *tab, unsigned long ip, unsigned long *off);
 
 /* ---------------- 用户符号 ---------------- */
 
