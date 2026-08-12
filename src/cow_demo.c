@@ -715,7 +715,9 @@ static int method1_report(struct method1_watch *w, struct config *cfg)
         if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
             char rdesc[160];
             describe_status(st, rdesc, sizeof(rdesc));
-            printf("[方式一][失败] 分析阶段异常: %s\n", rdesc);
+            printf("\n[方式一][失败] 分析阶段未得到有效结果: %s\n", rdesc);
+            /* 记录阶段日志里有 perf 自己打印的 "(N samples)", 是关键佐证 */
+            dump_log(w->logpath, "记录阶段输出");
             return -1;
         }
     }

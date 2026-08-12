@@ -223,10 +223,17 @@ tracefs 不存在、`do_wp_page` 不可探测或 perf record attach 失败。
 若日志停在 `perf probe --add do_wp_page` 且没有后续输出，说明探针注册特别慢，
 用 `--probe-timeout` 调大即可。
 
+### 方式一：`perf script` 没有输出
+
+report 阶段会打印 `perf script` 的 stderr（保存在 `<outdir>/script.err`）。此时
+事件数会回退到 `perf record` 自己在 `record.log` 里打印的 `(N samples)`，因此
+COW 汇总仍然可用，汇总中的「来源」一栏会注明取自哪一侧。
+
 ### 方式一：有 `perf.data` 但事件数为 0
 
-说明 perf 开始采样的时间晚于子进程写入。用 `--ready-timeout` 和 `--settle` 调大，
-再重试。
+说明 perf 开始采样的时间晚于子进程写入。用 `--settle` 调大（例如 `--settle 1000`）
+再重试；也可用 `sudo perf probe -l` 确认探针挂在预期位置。report 会打印这些排查
+建议并以非零状态退出。
 
 ### 方式二：未找到 tracefs
 

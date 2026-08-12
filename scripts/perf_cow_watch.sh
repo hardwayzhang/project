@@ -168,38 +168,76 @@ cmd_report() {
         fi
     fi
 
+    # 只保留一行十进制数字, 其余情况一律归零。
+    # grep -c 在无匹配时会打印 0 并返回 1, 因此不能写成 "|| echo 0"。
+    sanitize_count() {
+        case "$1" in
+            ''|*[!0-9]*) echo 0 ;;
+            *) echo "$1" ;;
+        esac
+    }
+
     echo "---------------- 子进程用户态调用栈 (perf script) ----------------"
     # 记录阶段使用 --user-callchains, perf.data 中不包含内核调用链。
-    run_perf script -i "$DATA" 2>/dev/null > "$OUT/script.txt" || true
+    # perf script 的 stderr 不能丢弃, 它是"没有输出"时唯一的线索。
+    run_perf script -i "$DATA" >"$OUT/script.txt" 2>"$OUT/script.err" || true
     if [ -s "$OUT/script.txt" ]; then
-        # 打印前 3 个样本块(以空行分隔)
-        awk 'BEGIN{n=0} /^$/{blank=1; print; next}
-             {print; if(blank){blank=0}}
-             /probe:do_wp_page/{ } ' "$OUT/script.txt" | head -n 60
+        head -n 60 "$OUT/script.txt"
     else
-        log "[方式一] perf script 无输出(可能未采集到事件)。"
+        log "[方式一] perf script 没有输出。"
+        if [ -s "$OUT/script.err" ]; then
+            log "[方式一] perf script 报错如下:"
+            sed 's/^/    /' "$OUT/script.err" >&2
+        fi
     fi
 
-    # 统计事件数: perf script 中每个样本含一行事件名 probe:do_wp_page
-    EVENTS=$(grep -c "probe:do_wp_page" "$OUT/script.txt" 2>/dev/null || echo 0)
-    if [ "$EVENTS" -eq 0 ]; then
-        # 退而求其次, 用 perf report 头部的 samples 数
-        EVENTS=$(run_perf report -i "$DATA" --stdio 2>/dev/null | \
-                 sed -n 's/.*of event .*Samples: \([0-9]*\).*/\1/p' | head -n1)
-        [ -n "$EVENTS" ] || EVENTS=0
+    EVENTS=$(sanitize_count "$(grep -c 'probe:do_wp_page' "$OUT/script.txt" 2>/dev/null || true)")
+
+    # perf record 自己在结束时会打印 "(N samples)", 它记录在 record.log 中,
+    # 是判断"到底有没有采到事件"最直接的依据。
+    # 找不到该行时保持为空, 以便和 "确实采到 0 个样本" 区分开
+    RECORDED=""
+    if [ -f "$OUT/record.log" ]; then
+        RECORDED=$(sed -n 's/.*(\([0-9][0-9]*\) samples).*/\1/p' \
+                   "$OUT/record.log" 2>/dev/null | tail -n1)
+        case "$RECORDED" in
+            ''|*[!0-9]*) RECORDED="" ;;
+        esac
+    fi
+
+    SOURCE="perf script"
+    if [ "$EVENTS" -eq 0 ] && [ -n "$RECORDED" ] && [ "$RECORDED" -gt 0 ]; then
+        EVENTS="$RECORDED"
+        SOURCE="perf record 自报样本数"
     fi
 
     COW_BYTES=$((EVENTS * PAGE_SIZE))
     COW_MIB=$(awk "BEGIN{printf \"%.2f\", $COW_BYTES/1048576}")
+    DATA_SIZE=$(wc -c < "$DATA" 2>/dev/null || echo 0)
 
     echo ""
     echo "--------------------- COW 内存汇总 ---------------------"
     echo "  采集事件源     : $PROBE_NAME"
     echo "  页大小         : $PAGE_SIZE 字节"
     [ -n "$PAGES" ] && echo "  子进程写入页数 : $PAGES"
-    echo "  采集到事件数   : $EVENTS"
+    echo "  perf.data 大小 : $DATA_SIZE 字节"
+    [ -n "$RECORDED" ] && echo "  perf 自报样本数 : $RECORDED"
+    echo "  采集到事件数   : $EVENTS (来源: $SOURCE)"
     echo "  估算 COW 内存  : $COW_BYTES 字节 ($COW_MIB MiB) = 事件数 x 页大小"
     echo "-------------------------------------------------------"
+
+    if [ "$EVENTS" -eq 0 ]; then
+        echo ""
+        echo "[方式一][告警] 采集到 0 个 $PROBE_NAME 事件。可能原因:"
+        echo "  1) perf record 实际开始采样晚于子进程写入 ——"
+        echo "     用 --settle 加大就绪后的静置时间(如 --settle 1000)重试;"
+        echo "  2) do_wp_page 被内联或探针挂在了不会命中的位置 ——"
+        echo "     用 sudo perf probe -l 确认探针位置;"
+        echo "  3) 子进程写入的页并未触发写保护缺页(例如内存并未真正预先驻留)。"
+        echo "  记录阶段完整日志: $OUT/record.log"
+        return 1
+    fi
+    return 0
 }
 
 [ $# -ge 1 ] || { usage; exit 2; }
