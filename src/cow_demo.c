@@ -749,9 +749,19 @@ static int run_watchers(struct config *cfg, size_t bytes, pid_t child,
     if (want1 && method1_start(&m1, cfg, child, bytes) < 0) failures++;
     if (want2 && method2_start(&m2, cfg, child) < 0) failures++;
 
-    printf("[父进程] watcher 就绪: 方式一=%s, 方式二=%s; 放行子进程。\n",
+    printf("[父进程] watcher 启动结果: 方式一=%s, 方式二=%s\n",
            m1.active ? "已启动" : (want1 ? "失败" : "未选择"),
            m2.active ? "已启动" : (want2 ? "失败" : "未选择"));
+
+    if (!m1.active && !m2.active) {
+        printf("[父进程][失败] 没有任何 watcher 成功启动，终止等待中的子进程，"
+               "不执行 COW 工作负载。\n");
+        kill(child, SIGTERM);
+        method2_cleanup(&m2);
+        return 1;
+    }
+
+    printf("[父进程] 至少一个 watcher 已启动，放行子进程。\n");
     notify(sp->go[1]);
     wait_for_child_write(&m2, sp->wrote[0], child);
 
