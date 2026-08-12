@@ -31,7 +31,9 @@ sudo ./cow_demo --watch both --size 16
 --watch W        method1|method2|both（默认 both）
 --size M         内存大小，单位 MiB（默认 16）
 --script PATH    方式一脚本（默认 scripts/perf_cow_watch.sh）
---warmup MS      等待 perf attach 的时间（默认 500ms）
+--probe-timeout MS  注册 do_wp_page 探针的超时（默认 60000）
+--ready-timeout MS  等待 perf record 开始采样的超时（默认 15000）
+--settle MS      确认就绪后额外静置时间（默认 200）
 --max-print N    方式二最多打印的样本数（默认 3）
 --max-frames N   每条用户态调用栈最多打印的帧数（默认 24）
 --verbose        成功时也打印方式一记录日志
@@ -66,6 +68,20 @@ sudo -n perf report ...
 
 如果整个程序已经通过 `sudo ./cow_demo` 启动，脚本检测到 uid 0 后会直接执行
 `perf`，不会再套一层 sudo。
+
+### 启动时序
+
+`perf probe --add do_wp_page` 需要解析 kallsyms/debuginfo，在大内核上常常耗时数秒。
+因此方式一分三步执行，确保 perf 真正开始采样后子进程才写入：
+
+1. **同步注册探针**：等待 `perf probe --add` 执行完毕，受 `--probe-timeout` 限制；
+2. **启动 perf record**：探针已存在，脚本带 `--skip-probe` 直接进入录制；
+3. **等待就绪**：轮询 `perf.data` 出现且非空。perf 在 `perf_event_open` 与 mmap
+   成功之后才写文件头，因此这是比固定 sleep 可靠的就绪信号；随后按 `--settle`
+   静置片刻再放行子进程。
+
+如果把探针注册和固定等待混在一起，一旦注册耗时超过等待时间，子进程就会在 perf
+尚未采样时跑完全部 COW 写入，最终得到空的或不存在的 `perf.data`。
 
 方式一需要：
 
@@ -190,6 +206,14 @@ sudo -n perf --version
 
 查看程序自动回放的 `<outdir>/record.log`。常见原因是 perf 与内核版本不匹配、
 tracefs 不存在、`do_wp_page` 不可探测或 perf record attach 失败。
+
+若日志停在 `perf probe --add do_wp_page` 且没有后续输出，说明探针注册特别慢，
+用 `--probe-timeout` 调大即可。
+
+### 方式一：有 `perf.data` 但事件数为 0
+
+说明 perf 开始采样的时间晚于子进程写入。用 `--ready-timeout` 和 `--settle` 调大，
+再重试。
 
 ### 方式二：未找到 tracefs
 

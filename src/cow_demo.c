@@ -65,7 +65,9 @@ struct config {
     int max_print;         /* 打印多少条样本调用栈 */
     int max_frames;        /* 每条调用栈最多打印多少帧 */
     const char *script;    /* 方式一脚本路径 */
-    int warmup_ms;         /* 方式一: 启动脚本后等待多久再放行子进程 */
+    int probe_timeout_ms;  /* 方式一: 同步注册 do_wp_page 探针的最长等待 */
+    int ready_timeout_ms;  /* 方式一: 等待 perf record 真正开始采样的最长时间 */
+    int settle_ms;         /* 方式一: 判定就绪后额外静置多久再放行子进程 */
     int verbose;
 };
 
@@ -483,6 +485,106 @@ static void method2_failure_log(struct method2_watch *w, const char *stage)
     if (f) fclose(f);
 }
 
+/*
+ * 同步注册 do_wp_page 探针。这一步可能很慢, 但它必须在放行子进程之前完成,
+ * 否则 perf 还没开始采样, COW 就已经全部发生完了。
+ */
+static int method1_add_probe(struct method1_watch *w, struct config *cfg)
+{
+    pid_t p = fork();
+    if (p == 0) {
+        int fd = open(w->logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) close(fd);
+        }
+        execl("/bin/sh", "sh", cfg->script, "add-probe", (char *)NULL);
+        fprintf(stderr, "execl(%s) 失败: %s\n", cfg->script, strerror(errno));
+        _exit(127);
+    }
+    if (p < 0) {
+        perror("fork(add-probe)");
+        return -1;
+    }
+
+    int waited = 0, st = 0;
+    for (;;) {
+        pid_t r = waitpid(p, &st, WNOHANG);
+        if (r == p) break;
+        if (r < 0) { st = 0; break; }
+        if (waited >= cfg->probe_timeout_ms) {
+            kill(p, SIGKILL);
+            waitpid(p, &st, 0);
+            printf("[方式一][失败] 注册 do_wp_page 探针超时 (>%d ms), 已终止。\n",
+                   cfg->probe_timeout_ms);
+            dump_log(w->logpath, "探针注册阶段输出");
+            printf("  提示: perf probe 解析 debuginfo 可能很慢, 可用 --probe-timeout "
+                   "调大; 也可先手动执行 sudo perf probe --add do_wp_page。\n");
+            return -1;
+        }
+        usleep(50 * 1000);
+        waited += 50;
+    }
+
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        char desc[160];
+        describe_status(st, desc, sizeof(desc));
+        printf("[方式一][失败] 注册 do_wp_page 探针失败: %s\n", desc);
+        dump_log(w->logpath, "探针注册阶段输出");
+        printf("  提示: 非 root 时经由 sudo -n perf 执行, 请先运行 sudo -v;\n"
+               "        并确认 tracefs 已挂载且内核支持 kprobe。\n");
+        return -1;
+    }
+    if (cfg->verbose)
+        printf("[方式一] 探针注册完成, 耗时约 %d ms。\n", waited);
+    return 0;
+}
+
+/*
+ * 等待 perf record 真正开始采样。
+ * perf 会在 perf_event_open + mmap 成功之后才写出 perf.data 头部, 因此
+ * "perf.data 出现且非空" 是一个比固定 sleep 可靠得多的就绪信号。
+ */
+static int method1_wait_ready(struct method1_watch *w, struct config *cfg)
+{
+    int waited = 0;
+    for (;;) {
+        int st = 0;
+        if (waitpid(w->recorder, &st, WNOHANG) == w->recorder) {
+            char desc[160];
+            describe_status(st, desc, sizeof(desc));
+            printf("[方式一][失败] 记录进程在开始采样前就退出了: %s\n", desc);
+            dump_log(w->logpath, "记录阶段输出");
+            printf("  提示: 非 root 模式通过 sudo -n perf 执行。请先运行 sudo -v，\n"
+                   "        并确认 sudoers/secure_path 允许 perf；也可执行 ./setup.sh 检查。\n");
+            return -1;
+        }
+
+        struct stat sb;
+        if (stat(w->datapath, &sb) == 0 && sb.st_size > 0) {
+            /* 再静置一小会儿, 抹平不同 perf 版本写头部与开始采样的次序差异 */
+            usleep((useconds_t)cfg->settle_ms * 1000);
+            if (cfg->verbose)
+                printf("[方式一] perf record 已开始采样 (等待 %d ms)。\n", waited);
+            return 0;
+        }
+
+        if (waited >= cfg->ready_timeout_ms) {
+            /*
+             * 记录进程还活着, 只是没等到就绪信号。继续往下走仍有可能采到数据,
+             * 所以这里只告警, 由最终的事件数来体现真实结果。
+             */
+            printf("[方式一][告警] 等待 %d ms 仍未确认 perf record 已开始采样,\n"
+                   "             继续执行; 若最终事件数为 0, 请用 --ready-timeout 调大。\n",
+                   cfg->ready_timeout_ms);
+            return 0;
+        }
+        usleep(50 * 1000);
+        waited += 50;
+    }
+}
+
 static int method1_start(struct method1_watch *w, struct config *cfg,
                          pid_t child, size_t bytes)
 {
@@ -507,18 +609,32 @@ static int method1_start(struct method1_watch *w, struct config *cfg,
     printf(" 记录日志: %s\n", w->logpath);
     printf("========================================================\n");
 
+    /* 每次运行重建日志: 注册阶段与记录阶段都追加到同一个文件 */
+    int lfd = open(w->logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (lfd >= 0) close(lfd);
+
+    /*
+     * 第一步: 同步注册探针。
+     * perf probe 需要解析 kallsyms/debuginfo, 常常要数秒。以前它和 perf record
+     * 一起塞在固定热身 sleep 里, 一旦超过热身时间, 子进程就会在 perf 尚未开始
+     * 采样时跑完全部 COW 写入, 最终连 perf.data 都没有。
+     */
+    if (method1_add_probe(w, cfg) < 0)
+        return -1;
+
+    /* 第二步: 启动记录进程, 探针已就绪, 它可以直接进入 perf record */
     w->recorder = fork();
     if (w->recorder == 0) {
         setpgid(0, 0);
         /* 把脚本与 perf 的 stdout/stderr 全部落盘, 失败时回放给用户 */
-        int lfd = open(w->logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (lfd >= 0) {
-            dup2(lfd, STDOUT_FILENO);
-            dup2(lfd, STDERR_FILENO);
-            if (lfd > STDERR_FILENO) close(lfd);
+        int fd = open(w->logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) close(fd);
         }
         execl("/bin/sh", "sh", cfg->script, "record",
-              "--pid", pidstr, "--out", w->outdir, (char *)NULL);
+              "--pid", pidstr, "--out", w->outdir, "--skip-probe", (char *)NULL);
         fprintf(stderr, "execl(%s) 失败: %s\n", cfg->script, strerror(errno));
         _exit(127);
     }
@@ -527,20 +643,11 @@ static int method1_start(struct method1_watch *w, struct config *cfg,
         return -1;
     }
     setpgid(w->recorder, w->recorder);
-    usleep((useconds_t)cfg->warmup_ms * 1000);
 
-    /* 热身结束后若记录进程已退出, 说明 perf probe / perf record 启动失败 */
-    int st = 0;
-    if (waitpid(w->recorder, &st, WNOHANG) == w->recorder) {
-        char desc[160];
-        describe_status(st, desc, sizeof(desc));
-        printf("[方式一][失败] 记录进程在热身期(%d ms)内就退出了: %s\n",
-               cfg->warmup_ms, desc);
-        dump_log(w->logpath, "记录阶段输出");
-        printf("  提示: 非 root 模式通过 sudo -n perf 执行。请先运行 sudo -v，\n"
-               "        并确认 sudoers/secure_path 允许 perf；也可执行 ./setup.sh 检查。\n");
+    /* 第三步: 等 perf record 真正开始采样, 而不是盲等一个固定时长 */
+    if (method1_wait_ready(w, cfg) < 0)
         return -1;
-    }
+
     w->active = 1;
     return 0;
 }
@@ -785,7 +892,9 @@ static void usage(const char *prog)
         "  --watch W        watcher: method1|method2|both (默认 both)\n"
         "  --size M         申请内存大小, 单位 MiB (默认 16)\n"
         "  --script PATH    方式一脚本路径 (默认 scripts/perf_cow_watch.sh)\n"
-        "  --warmup MS      方式一启动记录后的热身毫秒数 (默认 500)\n"
+        "  --probe-timeout MS  方式一注册 do_wp_page 探针的超时 (默认 60000)\n"
+        "  --ready-timeout MS  方式一等待 perf record 开始采样的超时 (默认 15000)\n"
+        "  --settle MS      确认就绪后额外静置毫秒数 (默认 200)\n"
         "  --max-print N    最多打印多少条样本调用栈 (默认 3)\n"
         "  --max-frames N   每条调用栈最多打印多少帧 (默认 24)\n"
         "  --verbose        打印更多诊断信息\n"
@@ -795,6 +904,9 @@ static void usage(const char *prog)
 
 int main(int argc, char **argv)
 {
+    /* 行缓冲: 输出重定向到文件时, 父子进程的日志仍按真实发生顺序排列 */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     page_size = sysconf(_SC_PAGESIZE);
 
     struct config cfg = {
@@ -803,7 +915,9 @@ int main(int argc, char **argv)
         .max_print = 3,
         .max_frames = 24,
         .script = "scripts/perf_cow_watch.sh",
-        .warmup_ms = 500,
+        .probe_timeout_ms = 60000,
+        .ready_timeout_ms = 15000,
+        .settle_ms = 200,
         .verbose = 0,
     };
 
@@ -811,7 +925,9 @@ int main(int argc, char **argv)
         {"watch", required_argument, 0, 'W'},
         {"size", required_argument, 0, 's'},
         {"script", required_argument, 0, 'c'},
-        {"warmup", required_argument, 0, 'w'},
+        {"probe-timeout", required_argument, 0, 'T'},
+        {"ready-timeout", required_argument, 0, 'R'},
+        {"settle", required_argument, 0, 'S'},
         {"max-print", required_argument, 0, 'p'},
         {"max-frames", required_argument, 0, 'f'},
         {"verbose", no_argument, 0, 'v'},
@@ -820,7 +936,7 @@ int main(int argc, char **argv)
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "W:s:c:w:p:f:vh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "W:s:c:T:R:S:p:f:vh", opts, NULL)) != -1) {
         switch (c) {
         case 'W':
             if (!strcmp(optarg, "both")) cfg.watch = WATCH_BOTH;
@@ -833,7 +949,9 @@ int main(int argc, char **argv)
             break;
         case 's': cfg.size_mib = strtoul(optarg, NULL, 10); break;
         case 'c': cfg.script = optarg; break;
-        case 'w': cfg.warmup_ms = atoi(optarg); break;
+        case 'T': cfg.probe_timeout_ms = atoi(optarg); break;
+        case 'R': cfg.ready_timeout_ms = atoi(optarg); break;
+        case 'S': cfg.settle_ms = atoi(optarg); break;
         case 'p': cfg.max_print = atoi(optarg); break;
         case 'f': cfg.max_frames = atoi(optarg); break;
         case 'v': cfg.verbose = 1; break;

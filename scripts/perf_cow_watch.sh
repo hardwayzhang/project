@@ -24,6 +24,7 @@ PROG=$(basename "$0")
 PAGE_SIZE=$(getconf PAGESIZE 2>/dev/null || echo 4096)
 PROBE_NAME="probe:do_wp_page"
 USE_SUDO=0
+PERF_MODE="未初始化"
 
 log()  { printf '%s\n' "$*" >&2; }
 die()  { log "[方式一][错误] $*"; exit 1; }
@@ -31,7 +32,7 @@ die()  { log "[方式一][错误] $*"; exit 1; }
 usage() {
     cat >&2 <<EOF
 用法:
-  $PROG record --pid <PID> --out <DIR>
+  $PROG record --pid <PID> --out <DIR> [--skip-probe]
   $PROG report --out <DIR> [--pages <N>]
   $PROG add-probe        # 仅注册 do_wp_page 探针
   $PROG del-probe        # 仅删除 do_wp_page 探针
@@ -43,6 +44,7 @@ need_perf() {
         command -v perf >/dev/null 2>&1 ||
             die "root 的 PATH 中未找到 perf, 请安装匹配内核的 linux-tools。"
         USE_SUDO=0
+        PERF_MODE="perf (cow_demo 已是 root)"
         return
     fi
 
@@ -52,6 +54,7 @@ need_perf() {
         die "sudo -n perf 不可用。请先执行 sudo -v 缓存凭据，确认 sudoers 允许 perf，并确认 sudo 的 secure_path 中能找到 perf。"
     fi
     USE_SUDO=1
+    PERF_MODE="sudo -n perf (cow_demo 以 uid=$(id -u) 运行)"
 }
 
 run_perf() {
@@ -67,17 +70,18 @@ run_perf() {
 # <out>/record.log, 失败时需要这些信息来定位原因。
 add_probe() {
     need_perf
-    log "[方式一] 权限模式: $([ \"$USE_SUDO\" -eq 1 ] && echo 'sudo -n perf' || echo 'perf (当前已是 root)')"
+    log "[方式一] 权限模式: $PERF_MODE"
     log "[方式一] perf 版本: $(run_perf --version 2>&1)"
-    log "[方式一] cow_demo 用户: $(id -un) (uid=$(id -u)), " \
-        "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo '?')"
+    log "[方式一] cow_demo 用户: $(id -un) (uid=$(id -u)), perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo '?')"
 
     if run_perf probe -l 2>&1 | grep -q "do_wp_page"; then
         log "[方式一] 探针 $PROBE_NAME 已存在。"
         return 0
     fi
 
-    log "[方式一] 执行: perf probe --add do_wp_page"
+    # perf probe 要解析 kallsyms/debuginfo, 在大内核上可能耗时数秒甚至更久,
+    # 所以调用方会在放行子进程之前同步执行它, 而不是塞进热身等待。
+    log "[方式一] 执行(可能耗时较久): perf probe --add do_wp_page"
     if run_perf probe --add do_wp_page 2>&1; then
         log "[方式一] 已注册探针 $PROBE_NAME。"
         return 0
@@ -95,10 +99,12 @@ del_probe() {
 cmd_record() {
     PID=""
     OUT=""
+    SKIP_PROBE=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --pid) PID="$2"; shift 2;;
             --out) OUT="$2"; shift 2;;
+            --skip-probe) SKIP_PROBE=1; shift;;
             *) die "record: 未知参数 $1";;
         esac
     done
@@ -107,7 +113,13 @@ cmd_record() {
     mkdir -p "$OUT"
 
     need_perf
-    add_probe
+    # --skip-probe: 探针已由调用方提前同步注册好, 这里直接进入 perf record,
+    # 让"启动记录进程"到"真正开始采样"之间的延迟尽量小。
+    if [ "$SKIP_PROBE" -eq 1 ]; then
+        log "[方式一] 探针由调用方预先注册, 跳过注册。权限模式: $PERF_MODE"
+    else
+        add_probe
+    fi
 
     if ! kill -0 "$PID" 2>/dev/null; then
         die "目标进程 $PID 不存在或不可见, 无法 attach。"
