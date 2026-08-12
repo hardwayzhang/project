@@ -148,7 +148,8 @@ tracepoint，因此仅设置为 `0` 不够。
 ### 方式二 `swfault` 回退
 
 - 不需要 tracefs 或 kprobe 写权限；
-- 因只采用户态调用栈，同 uid 子进程通常在 `perf_event_paranoid <= 2` 时可用。
+- 虽然只采用户态调用栈，但缺页事件由内核产生；同 uid 子进程仍要求
+  `perf_event_paranoid <= 1`，或 `cow_demo` 具有 `CAP_PERFMON`。
 
 ACL 示例（由管理员执行，路径按机器实际 tracefs 挂载点调整）：
 

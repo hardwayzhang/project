@@ -85,7 +85,8 @@ cat <<EOF
 
   方式二 swfault 回退:
     - 不需要 tracefs/kprobe；
-    - 仅采用户态调用栈，同 uid 子进程通常在 perf_event_paranoid <= 2 时可用。
+    - 仅采用户态调用栈，但缺页事件由内核产生，因此同 uid 子进程仍要求
+      perf_event_paranoid <= 1（或 cow_demo 具有 CAP_PERFMON）。
 
   本项目不采集内核调用栈、不解析内核地址，因此无需调整 kptr_restrict。
 EOF
@@ -176,7 +177,7 @@ else
     warn "方式二 kprobe 后端不可用；可选 --backend swfault"
 fi
 if [ "$IS_ROOT" -eq 1 ] || [ "$PARANOID" != "?" ] &&
-   [ "$PARANOID" -le 2 ] 2>/dev/null; then
+   [ "$PARANOID" -le 1 ] 2>/dev/null; then
     pass "方式二 swfault 回退预期可用"
 else
     warn "方式二 swfault 回退可能受 perf_event_paranoid 限制"
