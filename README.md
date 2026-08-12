@@ -90,12 +90,31 @@ sudo -n perf report ...
 3. tracefs 已挂载，内核启用了 kprobe/ftrace；
 4. `do_wp_page` 可探测。
 
-### perf.data 属主
+### perf.data 属主与 perf 的属主检查
 
 经由 `sudo -n perf` 录制时，`perf.data` 会由 root 创建（`root:root 0600`），非 root 的
-`cow_demo` 直接读不到。report 阶段会用 `sudo -n chown` 把它改回调用用户（失败时退化为
-`chmod a+r`），因此分析可以正常进行，文件之后也能被你手动查看。`cow_demo` 对
-`perf.data` 的判定基于“存在且非空”，不因当前进程一时读不到而误报失败。
+`cow_demo` 直接读不到。report 阶段先用 `sudo -n chown` 把它改回调用用户（失败时退化为
+`chmod a+r`）。`cow_demo` 对 `perf.data` 的判定基于“存在且非空”，不因当前进程一时读不到
+而误报失败。
+
+改属主之后还有一个坑：perf 自带属主安全检查（`tools/perf/util/data.c`）
+
+```c
+if (!file->force && st.st_uid && (st.st_uid != geteuid()))
+    pr_err("File %s not owned by current user or root (use -f to override)\n", ...);
+```
+
+只要文件属主既不是 root、也不等于 perf 进程的 euid 就会被拒绝。所以把 `perf.data` 归还
+给普通用户后，**不能再用 `sudo perf` 去分析**，否则 root 眼中该文件属于 uid=1000，正好
+命中检查。report 阶段据此选择身份：
+
+| perf.data 属主 | 分析身份 | 结果 |
+| --- | --- | --- |
+| 调用用户 | 当前用户 `perf` | `st_uid == euid`，放行 |
+| root | `sudo -n perf` | `st_uid == 0`，放行 |
+| 第三方 uid | 先按上面规则，再 `--force` 重试 | 放行 |
+
+分析只是读文件，不需要任何特权，因此优先用当前用户身份执行。
 
 记录阶段的全部 stdout/stderr 写入 `<outdir>/record.log`。以下情况都会回放日志并
 让 `cow_demo` 以非零状态退出：
@@ -222,6 +241,11 @@ tracefs 不存在、`do_wp_page` 不可探测或 perf record attach 失败。
 
 若日志停在 `perf probe --add do_wp_page` 且没有后续输出，说明探针注册特别慢，
 用 `--probe-timeout` 调大即可。
+
+### 方式一：`not owned by current user or root`
+
+perf 的属主安全检查，详见上面的「perf.data 属主与 perf 的属主检查」。report 阶段会
+自动选择正确的分析身份，并在仍被拒绝时用 `--force` 重试，无需手工处理。
 
 ### 方式一：`perf script` 没有输出
 

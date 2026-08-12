@@ -65,6 +65,16 @@ run_perf() {
     fi
 }
 
+# 分析阶段(perf script/report)专用: 只读 perf.data, 身份由 cmd_report 决定。
+ANALYZE_SUDO=1
+run_analyze() {
+    if [ "$ANALYZE_SUDO" -eq 1 ]; then
+        sudo -n perf "$@"
+    else
+        perf "$@"
+    fi
+}
+
 # 确保 do_wp_page 探针存在(幂等)。
 # 这里不屏蔽 perf 的输出: record 模式下调用方会把 stdout/stderr 收集到
 # <out>/record.log, 失败时需要这些信息来定位原因。
@@ -177,10 +187,35 @@ cmd_report() {
         esac
     }
 
+    # 选择分析身份。分析只是读文件, 不需要特权, 而 perf 有属主安全检查:
+    #   util/data.c: if (!force && st.st_uid && (st.st_uid != geteuid())) -> 拒绝
+    # 即"文件属主非 root 且不等于 perf 进程 euid"时报
+    #   File ... not owned by current user or root (use -f to override)
+    # 上面已把 perf.data 归还给调用用户, 此时若再用 sudo(root) 分析,
+    # root 眼中文件属于 uid=1000, 正好命中该检查。所以优先用当前用户身份分析;
+    # 只有当前用户读不到(chown 失败, 文件仍是 root:0600)时才退回 sudo,
+    # 那种情况下 st_uid==0, 检查同样会放行。
+    if [ -r "$DATA" ] && command -v perf >/dev/null 2>&1; then
+        ANALYZE_SUDO=0
+        ANALYZE_MODE="perf (当前用户身份, uid=$(id -u))"
+    else
+        ANALYZE_SUDO=1
+        ANALYZE_MODE="sudo -n perf (当前用户读不到 perf.data)"
+    fi
+    log "[方式一] 分析身份: $ANALYZE_MODE"
+
     echo "---------------- 子进程用户态调用栈 (perf script) ----------------"
     # 记录阶段使用 --user-callchains, perf.data 中不包含内核调用链。
     # perf script 的 stderr 不能丢弃, 它是"没有输出"时唯一的线索。
-    run_perf script -i "$DATA" >"$OUT/script.txt" 2>"$OUT/script.err" || true
+    run_analyze script -i "$DATA" >"$OUT/script.txt" 2>"$OUT/script.err" || true
+
+    # 兜底: 若仍撞上属主检查(例如属主被第三方改动), 用 --force 重试一次。
+    if [ ! -s "$OUT/script.txt" ] &&
+       grep -q "not owned by current user" "$OUT/script.err" 2>/dev/null; then
+        log "[方式一] 命中 perf 属主检查, 改用 --force 重试。"
+        run_analyze script --force -i "$DATA" \
+            >"$OUT/script.txt" 2>"$OUT/script.err" || true
+    fi
     if [ -s "$OUT/script.txt" ]; then
         head -n 60 "$OUT/script.txt"
     else
@@ -213,7 +248,9 @@ cmd_report() {
 
     COW_BYTES=$((EVENTS * PAGE_SIZE))
     COW_MIB=$(awk "BEGIN{printf \"%.2f\", $COW_BYTES/1048576}")
-    DATA_SIZE=$(wc -c < "$DATA" 2>/dev/null || echo 0)
+    # 用 stat 而非 "wc -c < $DATA": 后者要由 shell 打开文件, 当 perf.data 仍是
+    # root:0600 时会直接报 Permission denied; stat 只需目录搜索权限。
+    DATA_SIZE=$(stat -c %s "$DATA" 2>/dev/null || echo 0)
 
     echo ""
     echo "--------------------- COW 内存汇总 ---------------------"
