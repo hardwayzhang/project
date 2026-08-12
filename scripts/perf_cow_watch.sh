@@ -23,6 +23,7 @@ set -u
 PROG=$(basename "$0")
 PAGE_SIZE=$(getconf PAGESIZE 2>/dev/null || echo 4096)
 PROBE_NAME="probe:do_wp_page"
+USE_SUDO=0
 
 log()  { printf '%s\n' "$*" >&2; }
 die()  { log "[方式一][错误] $*"; exit 1; }
@@ -38,7 +39,27 @@ EOF
 }
 
 need_perf() {
-    command -v perf >/dev/null 2>&1 || die "未找到 perf, 请先安装 (linux-tools)。"
+    if [ "$(id -u)" -eq 0 ]; then
+        command -v perf >/dev/null 2>&1 ||
+            die "root 的 PATH 中未找到 perf, 请安装匹配内核的 linux-tools。"
+        USE_SUDO=0
+        return
+    fi
+
+    command -v sudo >/dev/null 2>&1 ||
+        die "当前是非 root, 但未安装 sudo。方式一要求通过 sudo perf 执行。"
+    if ! sudo -n perf --version >/dev/null 2>&1; then
+        die "sudo -n perf 不可用。请先执行 sudo -v 缓存凭据，确认 sudoers 允许 perf，并确认 sudo 的 secure_path 中能找到 perf。"
+    fi
+    USE_SUDO=1
+}
+
+run_perf() {
+    if [ "$USE_SUDO" -eq 1 ]; then
+        sudo -n perf "$@"
+    else
+        perf "$@"
+    fi
 }
 
 # 确保 do_wp_page 探针存在(幂等)。
@@ -46,17 +67,18 @@ need_perf() {
 # <out>/record.log, 失败时需要这些信息来定位原因。
 add_probe() {
     need_perf
-    log "[方式一] perf 版本: $(perf --version 2>&1)"
-    log "[方式一] 当前用户: $(id -un) (uid=$(id -u)), " \
+    log "[方式一] 权限模式: $([ \"$USE_SUDO\" -eq 1 ] && echo 'sudo -n perf' || echo 'perf (当前已是 root)')"
+    log "[方式一] perf 版本: $(run_perf --version 2>&1)"
+    log "[方式一] cow_demo 用户: $(id -un) (uid=$(id -u)), " \
         "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo '?')"
 
-    if perf probe -l 2>&1 | grep -q "do_wp_page"; then
+    if run_perf probe -l 2>&1 | grep -q "do_wp_page"; then
         log "[方式一] 探针 $PROBE_NAME 已存在。"
         return 0
     fi
 
     log "[方式一] 执行: perf probe --add do_wp_page"
-    if perf probe --add do_wp_page 2>&1; then
+    if run_perf probe --add do_wp_page 2>&1; then
         log "[方式一] 已注册探针 $PROBE_NAME。"
         return 0
     fi
@@ -64,9 +86,9 @@ add_probe() {
 }
 
 del_probe() {
-    command -v perf >/dev/null 2>&1 || return 0
-    perf probe --del "do_wp_page" >/dev/null 2>&1 || \
-        perf probe --del "$PROBE_NAME" >/dev/null 2>&1 || true
+    need_perf || return 0
+    run_perf probe --del "do_wp_page" >/dev/null 2>&1 || \
+        run_perf probe --del "$PROBE_NAME" >/dev/null 2>&1 || true
     log "[方式一] 已删除探针(若存在)。"
 }
 
@@ -95,8 +117,13 @@ cmd_record() {
     log "         perf record --user-callchains -e $PROBE_NAME -g -p $PID -o $OUT/perf.data"
     # 前台运行; 收到 SIGINT 时 perf 会停止并写出 perf.data。
     # 用 exec 让 SIGINT 直达 perf。
-    exec perf record --user-callchains -e "$PROBE_NAME" -g -p "$PID" \
-        -o "$OUT/perf.data"
+    if [ "$USE_SUDO" -eq 1 ]; then
+        exec sudo -n perf record --user-callchains -e "$PROBE_NAME" -g -p "$PID" \
+            -o "$OUT/perf.data"
+    else
+        exec perf record --user-callchains -e "$PROBE_NAME" -g -p "$PID" \
+            -o "$OUT/perf.data"
+    fi
 }
 
 cmd_report() {
@@ -117,7 +144,8 @@ cmd_report() {
 
     echo "---------------- 子进程用户态调用栈 (perf script) ----------------"
     # 记录阶段使用 --user-callchains, perf.data 中不包含内核调用链。
-    perf script -i "$DATA" 2>/dev/null > "$OUT/script.txt" || true
+    need_perf
+    run_perf script -i "$DATA" 2>/dev/null > "$OUT/script.txt" || true
     if [ -s "$OUT/script.txt" ]; then
         # 打印前 3 个样本块(以空行分隔)
         awk 'BEGIN{n=0} /^$/{blank=1; print; next}
@@ -131,7 +159,7 @@ cmd_report() {
     EVENTS=$(grep -c "probe:do_wp_page" "$OUT/script.txt" 2>/dev/null || echo 0)
     if [ "$EVENTS" -eq 0 ]; then
         # 退而求其次, 用 perf report 头部的 samples 数
-        EVENTS=$(perf report -i "$DATA" --stdio 2>/dev/null | \
+        EVENTS=$(run_perf report -i "$DATA" --stdio 2>/dev/null | \
                  sed -n 's/.*of event .*Samples: \([0-9]*\).*/\1/p' | head -n1)
         [ -n "$EVENTS" ] || EVENTS=0
     fi

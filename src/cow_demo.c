@@ -24,13 +24,8 @@
  *     子进程上, 通过 mmap 环形缓冲区读取每次事件的子进程用户态调用栈,
  *     统计事件数并汇总 COW 内存大小, 输出为文本。
  *
- *     若运行环境的内核未开放 kprobe/tracefs(例如受限容器), 方式二支持一个
- *     可移植回退后端 (--backend swfault): 改用 perf_event_open 订阅
- *     子进程的"软件缺页(page-fault)"事件。它复用完全相同的 perf 环形缓冲 +
- *     调用栈采集通路, 依然能采到子进程用户态调用栈并按缺页数汇总 COW 内存,
- *     只是事件源不是 do_wp_page 内核探针。该模式会明确打印告警。
- *
  *   未指定 --watch 时, 两种方式会针对同一个子进程同时启动。
+ *   方式二不提供 page-fault 回退: 任一步失败都会记录诊断并退出。
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -58,12 +53,6 @@
 #define KPROBE_EVENT "do_wp_page"
 #define KPROBE_SYMBOL "do_wp_page"
 
-enum backend {
-    BK_AUTO = 0,   /* 先试 kprobe, 不行则回退 swfault */
-    BK_KPROBE,     /* 仅使用 do_wp_page kprobe tracepoint */
-    BK_SWFAULT,    /* 软件缺页事件(可移植回退) */
-};
-
 enum watch_mode {
     WATCH_BOTH = 0,
     WATCH_METHOD1,
@@ -73,7 +62,6 @@ enum watch_mode {
 struct config {
     enum watch_mode watch; /* 默认同时启动方式一和方式二 */
     size_t size_mib;       /* 申请内存大小(MiB) */
-    enum backend backend;  /* 方式二后端 */
     int max_print;         /* 打印多少条样本调用栈 */
     int max_frames;        /* 每条调用栈最多打印多少帧 */
     const char *script;    /* 方式一脚本路径 */
@@ -170,7 +158,7 @@ static const char *find_tracefs(void)
 
 /*
  * 注册 do_wp_page kprobe, 返回其 tracepoint id; 失败返回 -1 并把失败原因
- * (含 errno 与可操作建议) 写入 reason, 供上层打印回退原因。
+ * (含 errno 与可操作建议) 写入 reason, 供上层记录后退出。
  */
 static int kprobe_register(const char *tracefs, char *reason, size_t rlen)
 {
@@ -350,68 +338,33 @@ static int is_ctx_marker(uint64_t ip) { return ip >= CTX_MAX; }
 
 /* ------------------------------ 方式二实现 ------------------------------ */
 
-/*
- * 打开针对子进程 child 的 perf_event。返回 fd, 失败 -1; *used 回填实际后端。
- * 若 kprobe 通路不可用, reason 中会保留导致回退的具体原因。
- */
-static int method2_open(pid_t child, enum backend want, int tp_id,
-                        enum backend *used, char *reason, size_t rlen)
+/* 打开子进程的 do_wp_page tracepoint；失败原因写入 reason。 */
+static int method2_open(pid_t child, int tp_id, char *reason, size_t rlen)
 {
     struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_TRACEPOINT;
+    attr.size = sizeof(attr);
+    attr.config = tp_id;
+    attr.sample_period = 1;
+    attr.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN;
+    attr.disabled = 1;
+    attr.exclude_callchain_kernel = 1;
+    attr.exclude_callchain_user = 0;
+    attr.wakeup_events = 1;
 
-    /* 尝试 kprobe tracepoint */
-    if ((want == BK_AUTO || want == BK_KPROBE) && tp_id >= 0) {
-        memset(&attr, 0, sizeof(attr));
-        attr.type = PERF_TYPE_TRACEPOINT;
-        attr.size = sizeof(attr);
-        attr.config = tp_id;
-        attr.sample_period = 1;
-        attr.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN;
-        attr.disabled = 1;
-        attr.exclude_callchain_kernel = 1;
-        attr.exclude_callchain_user = 0;
-        attr.wakeup_events = 1;
+    int fd = perf_event_open(&attr, child, -1, -1, 0);
+    if (fd >= 0)
+        return fd;
 
-        int fd = perf_event_open(&attr, child, -1, -1, 0);
-        if (fd >= 0) {
-            *used = BK_KPROBE;
-            return fd;
-        }
-        int e = errno;
-        const char *hint = "";
-        if (e == EACCES || e == EPERM)
-            hint = " (tracepoint 事件要求 perf_event_paranoid = -1 或 CAP_PERFMON)";
-        snprintf(reason, rlen,
-                 "kprobe tracepoint(id=%d) perf_event_open 失败: %s%s",
-                 tp_id, strerror(e), hint);
-        if (want == BK_KPROBE)
-            return -1;
-    }
-
-    /* 回退: 软件缺页事件 */
-    if (want == BK_AUTO || want == BK_SWFAULT) {
-        memset(&attr, 0, sizeof(attr));
-        attr.type = PERF_TYPE_SOFTWARE;
-        attr.size = sizeof(attr);
-        attr.config = PERF_COUNT_SW_PAGE_FAULTS;
-        attr.sample_period = 1;
-        attr.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN;
-        attr.disabled = 1;
-        attr.exclude_callchain_kernel = 1;
-        attr.exclude_callchain_user = 0;
-        attr.wakeup_events = 1;
-
-        int fd = perf_event_open(&attr, child, -1, -1, 0);
-        if (fd >= 0) {
-            *used = BK_SWFAULT;
-            return fd;
-        }
-        int e = errno;
-        fprintf(stderr, "[方式二] 软件缺页事件 perf_event_open 也失败: %s%s\n",
-                strerror(e),
-                (e == EACCES || e == EPERM)
-                    ? " (需要 perf_event_paranoid <= 1 或 CAP_PERFMON)" : "");
-    }
+    int e = errno;
+    const char *hint = "";
+    if (e == EACCES || e == EPERM)
+        hint = " (请执行 sudo ./cow_demo，或配置 tracefs ACL + "
+               "perf_event_paranoid=-1/CAP_PERFMON)";
+    snprintf(reason, rlen,
+             "kprobe tracepoint(id=%d) perf_event_open 失败: %s%s",
+             tp_id, strerror(e), hint);
     return -1;
 }
 
@@ -492,12 +445,43 @@ struct method2_watch {
     int active;
     int kprobe_ok;
     const char *tracefs;
-    enum backend used;
     struct collector col;
     usym_ctx_t *us;
     long long counter;
-    char reason[512];   /* 未能使用 do_wp_page kprobe 的原因 */
+    char reason[512];
+    char logpath[96];
 };
+
+/* 方式二不自动提权；失败时把执行上下文与原因同时写终端和独立日志。 */
+static void method2_failure_log(struct method2_watch *w, const char *stage)
+{
+    FILE *f = fopen(w->logpath, "a");
+    FILE *outs[2] = { stderr, f };
+    char paranoid[32] = "?";
+    FILE *pf = fopen("/proc/sys/kernel/perf_event_paranoid", "r");
+    if (pf) {
+        if (fscanf(pf, "%31s", paranoid) != 1)
+            snprintf(paranoid, sizeof(paranoid), "?");
+        fclose(pf);
+    }
+
+    for (int i = 0; i < 2; i++) {
+        FILE *o = outs[i];
+        if (!o) continue;
+        fprintf(o, "[方式二][失败] 阶段: %s\n", stage);
+        fprintf(o, "  uid=%d, euid=%d, perf_event_paranoid=%s\n",
+                (int)getuid(), (int)geteuid(), paranoid);
+        fprintf(o, "  tracefs=%s\n", w->tracefs ? w->tracefs : "未找到");
+        fprintf(o, "  原因: %s\n", w->reason[0] ? w->reason : "未知");
+        fprintf(o, "  日志: %s\n", w->logpath);
+        if (geteuid() != 0) {
+            fprintf(o, "  建议: 直接执行 sudo ./cow_demo；如果坚持非 root，需同时配置\n");
+            fprintf(o, "        tracefs ACL 与 perf_event_paranoid=-1/CAP_PERFMON。\n");
+        }
+        fflush(o);
+    }
+    if (f) fclose(f);
+}
 
 static int method1_start(struct method1_watch *w, struct config *cfg,
                          pid_t child, size_t bytes)
@@ -553,9 +537,8 @@ static int method1_start(struct method1_watch *w, struct config *cfg,
         printf("[方式一][失败] 记录进程在热身期(%d ms)内就退出了: %s\n",
                cfg->warmup_ms, desc);
         dump_log(w->logpath, "记录阶段输出");
-        printf("  提示: perf probe --add do_wp_page 需要 root/CAP_PERFMON 与可写的 "
-               "tracefs kprobe_events;\n"
-               "        也可先执行 ./setup.sh 检查依赖与权限。\n");
+        printf("  提示: 非 root 模式通过 sudo -n perf 执行。请先运行 sudo -v，\n"
+               "        并确认 sudoers/secure_path 允许 perf；也可执行 ./setup.sh 检查。\n");
         return -1;
     }
     w->active = 1;
@@ -588,12 +571,12 @@ static int method1_report(struct method1_watch *w, struct config *cfg)
         printf("  记录进程结束情况: %s\n", desc);
         dump_log(w->logpath, "记录阶段输出");
         printf("  常见原因:\n");
-        printf("    1) perf probe --add do_wp_page 失败 (无 root/CAP_PERFMON, "
-               "或 tracefs kprobe_events 不可写);\n");
-        printf("    2) 内核未导出 do_wp_page, 或该符号被内联/在 kprobe 黑名单中;\n");
-        printf("    3) perf record 无权 attach 目标进程 "
+        printf("    1) sudo -n perf 不可用 (未 sudo -v、sudoers 拒绝或 secure_path 找不到 perf);\n");
+        printf("    2) perf probe --add do_wp_page 失败 (tracefs/kprobe 不可用);\n");
+        printf("    3) 内核未导出 do_wp_page, 或该符号被内联/在 kprobe 黑名单中;\n");
+        printf("    4) perf record 无权 attach 目标进程 "
                "(perf_event_paranoid 过高);\n");
-        printf("    4) perf 版本与内核不匹配。\n");
+        printf("    5) perf 版本与内核不匹配。\n");
         printf("  可执行 ./setup.sh 逐项确认, 或手动运行:\n");
         printf("    %s record --pid <PID> --out <DIR>\n", cfg->script);
         return -1;
@@ -627,40 +610,39 @@ static int method2_start(struct method2_watch *w, struct config *cfg, pid_t chil
 {
     memset(w, 0, sizeof(*w));
     w->fd = -1;
+    snprintf(w->logpath, sizeof(w->logpath),
+             "/tmp/cow_demo_method2_%d.log", (int)child);
+    unlink(w->logpath);
     w->tracefs = find_tracefs();
     int tp_id = -1;
 
-    if (cfg->backend == BK_SWFAULT) {
-        snprintf(w->reason, sizeof(w->reason),
-                 "命令行显式指定了 --backend swfault");
-    } else if (!w->tracefs) {
+    if (!w->tracefs) {
         snprintf(w->reason, sizeof(w->reason),
                  "未找到 tracefs (已尝试 /proc/mounts、/sys/kernel/tracing、"
                  "/sys/kernel/debug/tracing); 内核可能未启用 ftrace/kprobe, "
                  "或容器未挂载 tracefs");
-    } else {
-        tp_id = kprobe_register(w->tracefs, w->reason, sizeof(w->reason));
-        if (tp_id >= 0) w->kprobe_ok = 1;
-    }
-
-    if (!w->kprobe_ok && cfg->backend == BK_KPROBE) {
-        fprintf(stderr,
-                "[方式二] 无法使用 do_wp_page kprobe (tracefs=%s)。\n"
-                "         原因: %s\n"
-                "         可改用 --backend swfault(语义不同, 见下文说明)。\n",
-                w->tracefs ? w->tracefs : "未找到", w->reason);
+        method2_failure_log(w, "查找 tracefs");
         return -1;
     }
 
-    w->fd = method2_open(child, cfg->backend, tp_id, &w->used,
-                         w->reason, sizeof(w->reason));
+    tp_id = kprobe_register(w->tracefs, w->reason, sizeof(w->reason));
+    if (tp_id < 0) {
+        method2_failure_log(w, "注册 do_wp_page kprobe / 读取动态事件 id");
+        return -1;
+    }
+    w->kprobe_ok = 1;
+
+    w->fd = method2_open(child, tp_id, w->reason, sizeof(w->reason));
     if (w->fd < 0) {
-        fprintf(stderr, "[方式二] perf_event_open 失败, 无法采集。\n");
-        if (w->kprobe_ok) kprobe_unregister(w->tracefs);
+        method2_failure_log(w, "perf_event_open(PERF_TYPE_TRACEPOINT)");
+        kprobe_unregister(w->tracefs);
+        w->kprobe_ok = 0;
         return -1;
     }
     if (collector_init(&w->col, w->fd, cfg->max_print) < 0) {
-        fprintf(stderr, "[方式二] mmap 环形缓冲失败: %s\n", strerror(errno));
+        snprintf(w->reason, sizeof(w->reason),
+                 "mmap perf 环形缓冲失败: %s", strerror(errno));
+        method2_failure_log(w, "mmap perf 环形缓冲");
         close(w->fd);
         w->fd = -1;
         if (w->kprobe_ok) {
@@ -671,24 +653,9 @@ static int method2_start(struct method2_watch *w, struct config *cfg, pid_t chil
     }
 
     printf("========================================================\n");
-    printf(" 方式二: perf_event_open 订阅 %s (仅用户态调用栈)\n",
-           w->used == BK_KPROBE ? "do_wp_page (kprobe tracepoint)"
-                                : "软件缺页事件 (PERF_COUNT_SW_PAGE_FAULTS)");
-    if (w->used == BK_SWFAULT) {
-        printf(" [告警] 未能使用 do_wp_page kprobe, 已回退到软件缺页后端。\n");
-        printf(" [回退原因] %s\n", w->reason);
-        printf(" [tracefs]   %s\n", w->tracefs ? w->tracefs : "未找到");
-        printf(" [事件语义差异]\n");
-        printf("   - do_wp_page: 内核写保护缺页处理函数。只有对\"已存在但只读\"的页\n");
-        printf("     执行写入才会进入, 这正是 fork 之后的 COW 路径; 一次事件对应\n");
-        printf("     一次真实的页复制, 因此 事件数 x 页大小 就是 COW 内存量。\n");
-        printf("   - PERF_COUNT_SW_PAGE_FAULTS: 统计进程的全部缺页, 既包含 COW 写\n");
-        printf("     保护缺页, 也包含首次访问匿名页(do_anonymous_page)、文件页读入\n");
-        printf("     (filemap_fault)、栈扩展等并不发生页复制的缺页。\n");
-        printf("   - 本 demo 中子进程只对 fork 前已驻留的私有页逐页写入, 绝大多数缺页\n");
-        printf("     就是 COW, 所以缺页数≈COW 数; 但仍会多出少量非 COW 缺页(如子进程\n");
-        printf("     首次执行 libc 代码路径), 统计值因此偏大, 属于近似而非精确。\n");
-    }
+    printf(" 方式二: perf_event_open 订阅 do_wp_page (kprobe tracepoint)\n");
+    printf(" 事件 id: %d, tracefs: %s\n", tp_id, w->tracefs);
+    printf(" 仅采集子进程用户态调用栈；无 page-fault fallback。\n");
     printf("========================================================\n");
 
     ioctl(w->fd, PERF_EVENT_IOC_RESET, 0);
@@ -746,8 +713,7 @@ static void method2_report(struct method2_watch *w, struct config *cfg,
     unsigned long long cow_bytes = events * (unsigned long long)page_size;
     printf("\n---------------- 方式二 COW 内存汇总 ----------------\n");
     printf("  目标子进程 PID     : %d\n", (int)child);
-    printf("  采集事件源         : %s\n",
-           w->used == BK_KPROBE ? "probe:do_wp_page" : "sw:page-faults(回退)");
+    printf("  采集事件源         : probe:do_wp_page\n");
     printf("  申请/写入内存      : %zu MiB (%zu 页, 页大小 %ld 字节)\n",
            cfg->size_mib, bytes / page_size, page_size);
     printf("  采集到事件数       : %llu\n", events);
@@ -756,8 +722,6 @@ static void method2_report(struct method2_watch *w, struct config *cfg,
         printf("  丢失样本(缓冲溢出) : %llu\n", w->col.n_lost);
     printf("  估算 COW 内存      : %llu 字节 (%.2f MiB) = 事件数 x 页大小\n",
            cow_bytes, cow_bytes / (1024.0 * 1024.0));
-    if (w->used == BK_SWFAULT && events > (unsigned long long)(bytes / page_size))
-        printf("  (注: 回退后端包含子进程执行路径产生的零星非 COW 缺页)\n");
     printf("------------------------------------------------------\n");
 }
 
@@ -810,7 +774,6 @@ static void usage(const char *prog)
         "用法: %s [选项]\n"
         "  --watch W        watcher: method1|method2|both (默认 both)\n"
         "  --size M         申请内存大小, 单位 MiB (默认 16)\n"
-        "  --backend B      方式二后端: auto|kprobe|swfault (默认 auto)\n"
         "  --script PATH    方式一脚本路径 (默认 scripts/perf_cow_watch.sh)\n"
         "  --warmup MS      方式一启动记录后的热身毫秒数 (默认 500)\n"
         "  --max-print N    最多打印多少条样本调用栈 (默认 3)\n"
@@ -827,7 +790,6 @@ int main(int argc, char **argv)
     struct config cfg = {
         .watch = WATCH_BOTH,
         .size_mib = 16,
-        .backend = BK_AUTO,
         .max_print = 3,
         .max_frames = 24,
         .script = "scripts/perf_cow_watch.sh",
@@ -838,7 +800,6 @@ int main(int argc, char **argv)
     static struct option opts[] = {
         {"watch", required_argument, 0, 'W'},
         {"size", required_argument, 0, 's'},
-        {"backend", required_argument, 0, 'b'},
         {"script", required_argument, 0, 'c'},
         {"warmup", required_argument, 0, 'w'},
         {"max-print", required_argument, 0, 'p'},
@@ -849,7 +810,7 @@ int main(int argc, char **argv)
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "W:s:b:c:w:p:f:vh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "W:s:c:w:p:f:vh", opts, NULL)) != -1) {
         switch (c) {
         case 'W':
             if (!strcmp(optarg, "both")) cfg.watch = WATCH_BOTH;
@@ -861,12 +822,6 @@ int main(int argc, char **argv)
             }
             break;
         case 's': cfg.size_mib = strtoul(optarg, NULL, 10); break;
-        case 'b':
-            if (!strcmp(optarg, "auto")) cfg.backend = BK_AUTO;
-            else if (!strcmp(optarg, "kprobe")) cfg.backend = BK_KPROBE;
-            else if (!strcmp(optarg, "swfault")) cfg.backend = BK_SWFAULT;
-            else { fprintf(stderr, "未知后端: %s\n", optarg); return 2; }
-            break;
         case 'c': cfg.script = optarg; break;
         case 'w': cfg.warmup_ms = atoi(optarg); break;
         case 'p': cfg.max_print = atoi(optarg); break;
