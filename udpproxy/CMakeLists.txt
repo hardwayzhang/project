@@ -1,14 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(udpproxy LANGUAGES CXX)
 
-# Prefer g++ when the default c++ is clang without a discoverable libstdc++.
-if(NOT CMAKE_CXX_COMPILER)
-  find_program(UDPPROXY_GXX g++)
-  if(UDPPROXY_GXX)
-    set(CMAKE_CXX_COMPILER "${UDPPROXY_GXX}" CACHE FILEPATH "" FORCE)
-  endif()
-endif()
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
